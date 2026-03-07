@@ -20,7 +20,9 @@
     ]
   },
   "bundle": {
-    "active": false,
-    "targets": "all"
+    "active": true,
+    "targets": [
+      "app"
+    ]
   }
 }

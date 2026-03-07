@@ -92,3 +92,22 @@ pnpm tauri build --debug
 - Settings 仅暴露 6 个高频字段，未覆盖全部 OpenClaw 配置项。
 - 操作成功与否依赖本机 OpenClaw、系统环境与命令执行权限。
 - 主要用于本地单机运维，不包含多实例集中管理能力。
+
+## 8. 安装包构建与 GitHub 产物
+
+本地生成可分发安装包（macOS）：
+
+```bash
+pnpm install
+pnpm package:mac
+```
+
+构建输出目录：
+
+- `artifacts/macos/`
+- 产物包含 `.app.zip`（分发压缩包）与 `.dmg`（终端用户安装包）
+
+GitHub 产物管理方式：
+
+- Actions Artifacts：每次 workflow 运行后上传 `artifacts/macos/` 中的构建产物，适合 CI 临时下载与验证。
+- GitHub Releases Assets：仅在推送 `v*` 标签时，把 `artifacts/macos/` 下的 `.zip` 与 `.dmg` 发布到 Release。

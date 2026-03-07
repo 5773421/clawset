@@ -8,7 +8,8 @@
     "dev": "vite --host 0.0.0.0 --port 1420",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "package:mac": "bash ./scripts/package-macos.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.0",
