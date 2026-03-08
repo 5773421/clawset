@@ -5,6 +5,8 @@ use serde_json::{Map, Value};
 use std::path::PathBuf;
 use std::process::Command;
 
+const OPENCLAW_PROGRAM: &str = "openclaw";
+
 const COMMON_SETTING_PATHS: [&str; 6] = [
     "update.channel",
     "update.checkOnStart",
@@ -72,6 +74,70 @@ fn run_command(program: &str, args: &[&str]) -> ExecOutput {
 
 fn run_shell(command: &str) -> ExecOutput {
     run_command("sh", &["-lc", command])
+}
+
+#[derive(Debug, Clone)]
+struct OpenclawExecutableResolution {
+    path_probe: ExecOutput,
+    command_path: Option<String>,
+    fallback_path: Option<String>,
+    executable_path: Option<String>,
+}
+
+fn select_openclaw_executable(
+    command_path: Option<String>,
+    fallback_path: Option<String>,
+) -> Option<String> {
+    command_path
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| fallback_path.filter(|value| !value.trim().is_empty()))
+}
+
+fn openclaw_program(executable_path: Option<&str>) -> String {
+    executable_path
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(OPENCLAW_PROGRAM)
+        .to_string()
+}
+
+fn missing_binary_error(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("no such file or directory")
+        || lower.contains("os error 2")
+        || lower.contains("not found")
+        || lower.contains("cannot find the file")
+}
+
+fn should_retry_openclaw_with_fallback(program: &str, exec: &ExecOutput) -> bool {
+    program != OPENCLAW_PROGRAM && exec.exit_code == -1 && missing_binary_error(&exec.stderr)
+}
+
+fn resolve_openclaw_executable() -> OpenclawExecutableResolution {
+    let path_probe = run_shell("command -v openclaw");
+    let command_path = extract_command_path(&path_probe.stdout);
+    let fallback_path = first_existing_file_path(&known_openclaw_binary_candidates());
+    let executable_path = select_openclaw_executable(command_path.clone(), fallback_path.clone());
+    OpenclawExecutableResolution {
+        path_probe,
+        command_path,
+        fallback_path,
+        executable_path,
+    }
+}
+
+fn run_openclaw_with_preferred_program(executable_path: Option<&str>, args: &[&str]) -> ExecOutput {
+    let program = openclaw_program(executable_path);
+    let exec = run_command(program.as_str(), args);
+    if should_retry_openclaw_with_fallback(program.as_str(), &exec) {
+        run_command(OPENCLAW_PROGRAM, args)
+    } else {
+        exec
+    }
+}
+
+fn run_openclaw_command(args: &[&str]) -> ExecOutput {
+    let resolution = resolve_openclaw_executable();
+    run_openclaw_with_preferred_program(resolution.executable_path.as_deref(), args)
 }
 
 fn is_allowed_setting(path: &str) -> bool {
@@ -288,21 +354,6 @@ fn extract_version_text(raw_stdout: &str) -> String {
     String::new()
 }
 
-fn should_prefer_alternative_exec(primary: &ExecOutput, alternative: &ExecOutput) -> bool {
-    let primary_strong = primary.exit_code == 0 && !primary.stdout.is_empty();
-    if primary_strong {
-        return false;
-    }
-
-    let alternative_strong = alternative.exit_code == 0 && !alternative.stdout.is_empty();
-    if alternative_strong {
-        return true;
-    }
-
-    (primary.exit_code != 0 && alternative.exit_code == 0)
-        || (primary.stdout.is_empty() && !alternative.stdout.is_empty())
-}
-
 fn extract_config_file_path(raw_stdout: &str) -> String {
     let lines = clean_non_empty_lines(raw_stdout);
     for line in lines.iter().rev() {
@@ -402,49 +453,16 @@ fn open_url(url: &str) -> ExecOutput {
 
 #[tauri::command]
 fn detect_openclaw() -> CommandResponse {
-    let path_probe = run_shell("command -v openclaw");
-    let command_path = extract_command_path(&path_probe.stdout);
-    let fallback_path = first_existing_file_path(&known_openclaw_binary_candidates());
-    let executable_path = command_path.clone().or(fallback_path.clone());
+    let resolution = resolve_openclaw_executable();
     let install_dir = first_existing_dir_path(&known_openclaw_install_dirs());
+    let program = openclaw_program(resolution.executable_path.as_deref());
 
-    let version_on_path = run_command("openclaw", &["--version"]);
-    let config_on_path = run_command("openclaw", &["config", "file"]);
-
-    let alternative_version = executable_path.as_ref().and_then(|program| {
-        if program == "openclaw" {
-            None
-        } else {
-            Some((program.clone(), run_command(program, &["--version"])))
-        }
-    });
-    let alternative_config = executable_path.as_ref().and_then(|program| {
-        if program == "openclaw" {
-            None
-        } else {
-            Some((program.clone(), run_command(program, &["config", "file"])))
-        }
-    });
-
-    let version = if let Some((_, alt)) = &alternative_version {
-        if should_prefer_alternative_exec(&version_on_path, alt) {
-            alt.clone()
-        } else {
-            version_on_path.clone()
-        }
-    } else {
-        version_on_path.clone()
-    };
-
-    let config_file = if let Some((_, alt)) = &alternative_config {
-        if should_prefer_alternative_exec(&config_on_path, alt) {
-            alt.clone()
-        } else {
-            config_on_path.clone()
-        }
-    } else {
-        config_on_path.clone()
-    };
+    let version =
+        run_openclaw_with_preferred_program(resolution.executable_path.as_deref(), &["--version"]);
+    let config_file = run_openclaw_with_preferred_program(
+        resolution.executable_path.as_deref(),
+        &["config", "file"],
+    );
 
     let version_text = extract_version_text(&version.stdout);
     let config_file_path = if config_file.exit_code == 0 {
@@ -457,7 +475,7 @@ fn detect_openclaw() -> CommandResponse {
     } else {
         default_openclaw_config_file().unwrap_or_default()
     };
-    let display_path = executable_path.unwrap_or_default();
+    let display_path = resolution.executable_path.clone().unwrap_or_default();
 
     let has_executable = !display_path.is_empty();
     let has_install_dir = install_dir.is_some();
@@ -526,34 +544,33 @@ fn detect_openclaw() -> CommandResponse {
     ));
 
     let mut stderr_lines = Vec::new();
-    if !version_on_path.stderr.is_empty() {
-        stderr_lines.push(format!("openclaw --version: {}", version_on_path.stderr));
+    if !resolution.path_probe.stderr.is_empty() {
+        stderr_lines.push(format!(
+            "command -v openclaw: {}",
+            resolution.path_probe.stderr
+        ));
     }
-    if let Some((program, alt)) = &alternative_version {
-        if !alt.stderr.is_empty() {
-            stderr_lines.push(format!("{program} --version: {}", alt.stderr));
+    if !version.stderr.is_empty() {
+        stderr_lines.push(format!("{program} --version: {}", version.stderr));
+    }
+    if !config_file.stderr.is_empty() {
+        stderr_lines.push(format!("{program} config file: {}", config_file.stderr));
+    }
+    if let Some(path) = &resolution.command_path {
+        if !path.is_empty() && path != &display_path {
+            stderr_lines.push(format!("command_path: {path}"));
         }
     }
-    if !path_probe.stderr.is_empty() {
-        stderr_lines.push(format!("command -v openclaw: {}", path_probe.stderr));
-    }
-    if !config_on_path.stderr.is_empty() {
-        stderr_lines.push(format!("openclaw config file: {}", config_on_path.stderr));
-    }
-    if let Some((program, alt)) = &alternative_config {
-        if !alt.stderr.is_empty() {
-            stderr_lines.push(format!("{program} config file: {}", alt.stderr));
+    if let Some(path) = &resolution.fallback_path {
+        if !path.is_empty() && path != &display_path {
+            stderr_lines.push(format!("fallback_path: {path}"));
         }
     }
     CommandResponse {
         success,
         stdout: stdout_lines.join("\n"),
         stderr: stderr_lines.join("\n"),
-        exit_code: if success {
-            0
-        } else {
-            version_on_path.exit_code
-        },
+        exit_code: if success { 0 } else { version.exit_code },
         message: if success {
             "OpenClaw detected".to_string()
         } else {
@@ -587,7 +604,7 @@ fn gateway_control(action: String) -> CommandResponse {
         );
     }
 
-    let exec = run_command("openclaw", &["gateway", action.as_str(), "--json"]);
+    let exec = run_openclaw_command(&["gateway", action.as_str(), "--json"]);
     let mut response =
         CommandResponse::from_exec(exec, format!("Gateway {} command completed", action));
     if !response.success {
@@ -598,7 +615,7 @@ fn gateway_control(action: String) -> CommandResponse {
 
 #[tauri::command]
 fn gateway_status() -> CommandResponse {
-    let exec = run_command("openclaw", &["gateway", "status", "--json"]);
+    let exec = run_openclaw_command(&["gateway", "status", "--json"]);
     let parsed_json = serde_json::from_str::<Value>(&exec.stdout).ok();
 
     let mut response = CommandResponse::from_exec(exec, "Gateway status fetched");
@@ -611,7 +628,7 @@ fn gateway_status() -> CommandResponse {
 
 #[tauri::command]
 fn get_config_file() -> CommandResponse {
-    let exec = run_command("openclaw", &["config", "file"]);
+    let exec = run_openclaw_command(&["config", "file"]);
     let mut response = CommandResponse::from_exec(exec, "Config file path fetched");
     if response.success {
         response.stdout = extract_config_file_path(&response.stdout);
@@ -634,7 +651,7 @@ fn get_common_settings() -> CommandResponse {
     let mut success = true;
 
     for path in COMMON_SETTING_PATHS {
-        let exec = run_command("openclaw", &["config", "get", path]);
+        let exec = run_openclaw_command(&["config", "get", path]);
         if exec.exit_code == 0 {
             let value = extract_config_get_value(path, &exec.stdout);
             parsed_settings.insert(path.to_string(), Value::String(value.clone()));
@@ -677,10 +694,7 @@ fn set_common_setting(path: String, value: String) -> CommandResponse {
         );
     }
 
-    let exec = run_command(
-        "openclaw",
-        &["config", "set", path.as_str(), value.as_str()],
-    );
+    let exec = run_openclaw_command(&["config", "set", path.as_str(), value.as_str()]);
     let mut response = CommandResponse::from_exec(exec, format!("Updated setting {path}"));
     if !response.success {
         response.message = format!("Failed to update {path}");
@@ -690,7 +704,7 @@ fn set_common_setting(path: String, value: String) -> CommandResponse {
 
 #[tauri::command]
 fn open_dashboard() -> CommandResponse {
-    let dashboard_exec = run_command("openclaw", &["dashboard", "--no-open"]);
+    let dashboard_exec = run_openclaw_command(&["dashboard", "--no-open"]);
     if dashboard_exec.exit_code != 0 {
         return CommandResponse::from_exec(dashboard_exec, "Failed to fetch dashboard URL");
     }
@@ -790,6 +804,60 @@ openclaw is /opt/homebrew/bin/openclaw
             extract_command_path(raw),
             Some("/opt/homebrew/bin/openclaw".to_string())
         );
+    }
+
+    #[test]
+    fn select_openclaw_executable_prefers_command_path() {
+        assert_eq!(
+            select_openclaw_executable(
+                Some("/usr/local/bin/openclaw".to_string()),
+                Some("/opt/homebrew/bin/openclaw".to_string())
+            ),
+            Some("/usr/local/bin/openclaw".to_string())
+        );
+    }
+
+    #[test]
+    fn select_openclaw_executable_falls_back_to_known_path() {
+        assert_eq!(
+            select_openclaw_executable(None, Some("/opt/homebrew/bin/openclaw".to_string())),
+            Some("/opt/homebrew/bin/openclaw".to_string())
+        );
+    }
+
+    #[test]
+    fn openclaw_program_uses_bare_command_when_path_missing() {
+        assert_eq!(openclaw_program(None), OPENCLAW_PROGRAM.to_string());
+    }
+
+    #[test]
+    fn retries_with_bare_openclaw_when_preferred_binary_is_missing() {
+        let exec = ExecOutput {
+            stdout: String::new(),
+            stderr: "No such file or directory (os error 2)".to_string(),
+            exit_code: -1,
+        };
+        assert!(should_retry_openclaw_with_fallback(
+            "/opt/homebrew/bin/openclaw",
+            &exec
+        ));
+        assert!(!should_retry_openclaw_with_fallback(
+            OPENCLAW_PROGRAM,
+            &exec
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_with_bare_openclaw_for_non_spawn_errors() {
+        let exec = ExecOutput {
+            stdout: String::new(),
+            stderr: "gateway returned non-zero".to_string(),
+            exit_code: 1,
+        };
+        assert!(!should_retry_openclaw_with_fallback(
+            "/opt/homebrew/bin/openclaw",
+            &exec
+        ));
     }
 
     #[test]
