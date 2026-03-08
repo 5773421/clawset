@@ -2,6 +2,7 @@
 
 use serde::Serialize;
 use serde_json::{Map, Value};
+use std::path::PathBuf;
 use std::process::Command;
 
 const COMMON_SETTING_PATHS: [&str; 6] = [
@@ -13,7 +14,7 @@ const COMMON_SETTING_PATHS: [&str; 6] = [
     "agents.defaults.heartbeat.every",
 ];
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ExecOutput {
     stdout: String,
     stderr: String,
@@ -198,6 +199,110 @@ fn looks_like_path(value: &str) -> bool {
         && value.chars().any(|ch| ch.is_ascii_alphanumeric())
 }
 
+fn extract_command_path(raw_stdout: &str) -> Option<String> {
+    for line in clean_non_empty_lines(raw_stdout) {
+        if looks_like_path(line.as_str()) {
+            return Some(line);
+        }
+
+        for token in line.split_whitespace() {
+            let candidate = normalize_token(token);
+            if looks_like_path(candidate) {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+fn first_existing_file_path(candidates: &[PathBuf]) -> Option<String> {
+    candidates
+        .iter()
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.to_string_lossy().to_string())
+}
+
+fn first_existing_dir_path(candidates: &[PathBuf]) -> Option<String> {
+    candidates
+        .iter()
+        .find(|candidate| candidate.is_dir())
+        .map(|candidate| candidate.to_string_lossy().to_string())
+}
+
+fn known_openclaw_binary_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(home) = home_dir() {
+        candidates.push(home.join(".openclaw").join("bin").join("openclaw"));
+        candidates.push(home.join(".local").join("bin").join("openclaw"));
+    }
+    candidates.push(PathBuf::from("/usr/local/bin/openclaw"));
+    candidates.push(PathBuf::from("/opt/homebrew/bin/openclaw"));
+    candidates.push(PathBuf::from("/usr/bin/openclaw"));
+    candidates
+}
+
+fn known_openclaw_install_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = home_dir() {
+        dirs.push(home.join(".openclaw"));
+    }
+    if let Some(path) = std::env::var_os("OPENCLAW_HOME") {
+        dirs.push(PathBuf::from(path));
+    }
+    dirs
+}
+
+fn default_openclaw_config_file() -> Option<String> {
+    let candidate = home_dir()?.join(".openclaw").join("openclaw.json");
+    if candidate.is_file() {
+        Some(candidate.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
+fn extract_version_text(raw_stdout: &str) -> String {
+    let lines = clean_non_empty_lines(raw_stdout);
+    for line in lines.iter().rev() {
+        if line_seems_banner_noise(line) {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("version") || line.chars().any(|ch| ch.is_ascii_digit()) {
+            return line.trim().to_string();
+        }
+    }
+
+    for line in lines.iter().rev() {
+        if !line_seems_banner_noise(line) {
+            return line.trim().to_string();
+        }
+    }
+
+    String::new()
+}
+
+fn should_prefer_alternative_exec(primary: &ExecOutput, alternative: &ExecOutput) -> bool {
+    let primary_strong = primary.exit_code == 0 && !primary.stdout.is_empty();
+    if primary_strong {
+        return false;
+    }
+
+    let alternative_strong = alternative.exit_code == 0 && !alternative.stdout.is_empty();
+    if alternative_strong {
+        return true;
+    }
+
+    (primary.exit_code != 0 && alternative.exit_code == 0)
+        || (primary.stdout.is_empty() && !alternative.stdout.is_empty())
+}
+
 fn extract_config_file_path(raw_stdout: &str) -> String {
     let lines = clean_non_empty_lines(raw_stdout);
     for line in lines.iter().rev() {
@@ -297,57 +402,157 @@ fn open_url(url: &str) -> ExecOutput {
 
 #[tauri::command]
 fn detect_openclaw() -> CommandResponse {
-    let version = run_command("openclaw", &["--version"]);
-    let path = run_shell("command -v openclaw");
-    let config_file = run_command("openclaw", &["config", "file"]);
+    let path_probe = run_shell("command -v openclaw");
+    let command_path = extract_command_path(&path_probe.stdout);
+    let fallback_path = first_existing_file_path(&known_openclaw_binary_candidates());
+    let executable_path = command_path.clone().or(fallback_path.clone());
+    let install_dir = first_existing_dir_path(&known_openclaw_install_dirs());
+
+    let version_on_path = run_command("openclaw", &["--version"]);
+    let config_on_path = run_command("openclaw", &["config", "file"]);
+
+    let alternative_version = executable_path.as_ref().and_then(|program| {
+        if program == "openclaw" {
+            None
+        } else {
+            Some((program.clone(), run_command(program, &["--version"])))
+        }
+    });
+    let alternative_config = executable_path.as_ref().and_then(|program| {
+        if program == "openclaw" {
+            None
+        } else {
+            Some((program.clone(), run_command(program, &["config", "file"])))
+        }
+    });
+
+    let version = if let Some((_, alt)) = &alternative_version {
+        if should_prefer_alternative_exec(&version_on_path, alt) {
+            alt.clone()
+        } else {
+            version_on_path.clone()
+        }
+    } else {
+        version_on_path.clone()
+    };
+
+    let config_file = if let Some((_, alt)) = &alternative_config {
+        if should_prefer_alternative_exec(&config_on_path, alt) {
+            alt.clone()
+        } else {
+            config_on_path.clone()
+        }
+    } else {
+        config_on_path.clone()
+    };
+
+    let version_text = extract_version_text(&version.stdout);
+    let config_file_path = if config_file.exit_code == 0 {
+        let extracted = extract_config_file_path(&config_file.stdout);
+        if extracted.is_empty() {
+            default_openclaw_config_file().unwrap_or_default()
+        } else {
+            extracted
+        }
+    } else {
+        default_openclaw_config_file().unwrap_or_default()
+    };
+    let display_path = executable_path.unwrap_or_default();
+
+    let has_executable = !display_path.is_empty();
+    let has_install_dir = install_dir.is_some();
+    let has_config_file = !config_file_path.is_empty();
+    let has_version_signal = version.exit_code == 0 || !version_text.is_empty();
+
+    let mut detected_by = Vec::new();
+    if has_executable {
+        detected_by.push("executable_path");
+    }
+    if has_install_dir {
+        detected_by.push("install_dir");
+    }
+    if has_config_file {
+        detected_by.push("config_file");
+    }
+    if has_version_signal {
+        detected_by.push("version");
+    }
+
+    let success = has_executable || has_install_dir || has_config_file || has_version_signal;
+    let install_dir_text = install_dir.unwrap_or_default();
 
     let mut stdout_lines = vec![
+        format!("installed: {}", success),
+        format!(
+            "detected_by: {}",
+            if detected_by.is_empty() {
+                "(none)".to_string()
+            } else {
+                detected_by.join(",")
+            }
+        ),
         format!(
             "version: {}",
-            if version.stdout.is_empty() {
+            if version_text.is_empty() {
                 "(empty)"
             } else {
-                &version.stdout
+                version_text.as_str()
             }
         ),
         format!(
             "path: {}",
-            if path.stdout.is_empty() {
+            if display_path.is_empty() {
                 "(empty)"
             } else {
-                &path.stdout
+                display_path.as_str()
+            }
+        ),
+        format!(
+            "install_dir: {}",
+            if install_dir_text.is_empty() {
+                "(empty)"
+            } else {
+                install_dir_text.as_str()
             }
         ),
     ];
-    if config_file.exit_code == 0 {
-        stdout_lines.push(format!(
-            "config_file: {}",
-            extract_config_file_path(&config_file.stdout)
-        ));
-    }
+    stdout_lines.push(format!(
+        "config_file: {}",
+        if config_file_path.is_empty() {
+            "(empty)"
+        } else {
+            config_file_path.as_str()
+        }
+    ));
 
     let mut stderr_lines = Vec::new();
-    if !version.stderr.is_empty() {
-        stderr_lines.push(format!("openclaw --version: {}", version.stderr));
+    if !version_on_path.stderr.is_empty() {
+        stderr_lines.push(format!("openclaw --version: {}", version_on_path.stderr));
     }
-    if !path.stderr.is_empty() {
-        stderr_lines.push(format!("command -v openclaw: {}", path.stderr));
+    if let Some((program, alt)) = &alternative_version {
+        if !alt.stderr.is_empty() {
+            stderr_lines.push(format!("{program} --version: {}", alt.stderr));
+        }
     }
-    if !config_file.stderr.is_empty() {
-        stderr_lines.push(format!("openclaw config file: {}", config_file.stderr));
+    if !path_probe.stderr.is_empty() {
+        stderr_lines.push(format!("command -v openclaw: {}", path_probe.stderr));
     }
-
-    let success = version.exit_code == 0 && path.exit_code == 0;
+    if !config_on_path.stderr.is_empty() {
+        stderr_lines.push(format!("openclaw config file: {}", config_on_path.stderr));
+    }
+    if let Some((program, alt)) = &alternative_config {
+        if !alt.stderr.is_empty() {
+            stderr_lines.push(format!("{program} config file: {}", alt.stderr));
+        }
+    }
     CommandResponse {
         success,
         stdout: stdout_lines.join("\n"),
         stderr: stderr_lines.join("\n"),
         exit_code: if success {
             0
-        } else if version.exit_code != 0 {
-            version.exit_code
         } else {
-            path.exit_code
+            version_on_path.exit_code
         },
         message: if success {
             "OpenClaw detected".to_string()
@@ -574,6 +779,51 @@ Documentation: https://openclaw.ai/docs
 beta";
 
         assert_eq!(extract_config_get_value("update.channel", raw), "beta");
+    }
+
+    #[test]
+    fn extracts_command_path_from_command_v_output() {
+        let raw = "\
+openclaw is /opt/homebrew/bin/openclaw
+";
+        assert_eq!(
+            extract_command_path(raw),
+            Some("/opt/homebrew/bin/openclaw".to_string())
+        );
+    }
+
+    #[test]
+    fn picks_first_existing_file_path() {
+        let base = std::env::temp_dir().join(format!("clawset-test-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("create temp dir");
+
+        let missing = base.join("missing-openclaw");
+        let existing = base.join("openclaw");
+        std::fs::write(&existing, "#!/bin/sh\necho ok\n").expect("create temp file");
+
+        assert_eq!(
+            first_existing_file_path(&[missing, existing.clone()]),
+            Some(existing.to_string_lossy().to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn picks_first_existing_dir_path() {
+        let base = std::env::temp_dir().join(format!("clawset-test-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let missing = base.join("missing");
+        let existing = base.join("exists");
+        std::fs::create_dir_all(&existing).expect("create existing dir");
+
+        assert_eq!(
+            first_existing_dir_path(&[missing, existing.clone()]),
+            Some(existing.to_string_lossy().to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 
