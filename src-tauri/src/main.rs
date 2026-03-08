@@ -2,7 +2,8 @@
 
 use serde::Serialize;
 use serde_json::{Map, Value};
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const OPENCLAW_PROGRAM: &str = "openclaw";
@@ -58,7 +59,17 @@ impl CommandResponse {
 }
 
 fn run_command(program: &str, args: &[&str]) -> ExecOutput {
-    match Command::new(program).args(args).output() {
+    run_command_with_path(program, args, None)
+}
+
+fn run_command_with_path(program: &str, args: &[&str], path_override: Option<&str>) -> ExecOutput {
+    let mut command = Command::new(program);
+    command.args(args);
+    if let Some(path_value) = path_override {
+        command.env("PATH", path_value);
+    }
+
+    match command.output() {
         Ok(output) => ExecOutput {
             stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
@@ -82,6 +93,24 @@ struct OpenclawExecutableResolution {
     command_path: Option<String>,
     fallback_path: Option<String>,
     executable_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpenclawLaunchStrategy {
+    Program {
+        program: String,
+    },
+    NodeScript {
+        node_path: String,
+        script_path: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct OpenclawExecutionContext {
+    resolution: OpenclawExecutableResolution,
+    strategy: OpenclawLaunchStrategy,
+    path_override: Option<String>,
 }
 
 fn select_openclaw_executable(
@@ -125,19 +154,286 @@ fn resolve_openclaw_executable() -> OpenclawExecutableResolution {
     }
 }
 
-fn run_openclaw_with_preferred_program(executable_path: Option<&str>, args: &[&str]) -> ExecOutput {
-    let program = openclaw_program(executable_path);
-    let exec = run_command(program.as_str(), args);
-    if should_retry_openclaw_with_fallback(program.as_str(), &exec) {
-        run_command(OPENCLAW_PROGRAM, args)
+fn shebang_uses_env_node(line: &str) -> bool {
+    let Some(content) = line.trim().strip_prefix("#!") else {
+        return false;
+    };
+    let mut parts = content.split_whitespace();
+    let Some(env_path) = parts.next() else {
+        return false;
+    };
+    if env_path != "/usr/bin/env" && env_path != "/bin/env" {
+        return false;
+    }
+
+    let Some(next) = parts.next() else {
+        return false;
+    };
+    if next == "node" {
+        return true;
+    }
+
+    next == "-S" && parts.next() == Some("node")
+}
+
+fn has_env_node_shebang(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let first_line_end = bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(bytes.len());
+    let first_line = String::from_utf8_lossy(&bytes[..first_line_end]);
+    shebang_uses_env_node(first_line.trim_end_matches('\r'))
+}
+
+fn detect_node_shebang_script_path(executable_path: &str) -> Option<String> {
+    let path = Path::new(executable_path);
+    if path.is_file() && has_env_node_shebang(path) {
+        Some(path.to_string_lossy().to_string())
     } else {
-        exec
+        None
+    }
+}
+
+fn parse_node_version_name(value: &str) -> Option<(u64, u64, u64)> {
+    let version = value.strip_prefix('v').unwrap_or(value);
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+fn known_nvm_node_binary_candidates(home: &Path) -> Vec<PathBuf> {
+    let versions_dir = home.join(".nvm").join("versions").join("node");
+    let Ok(entries) = std::fs::read_dir(versions_dir) else {
+        return Vec::new();
+    };
+
+    let mut versioned_paths: Vec<(Option<(u64, u64, u64)>, String, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .filter_map(|path| {
+            let version_name = path.file_name()?.to_string_lossy().to_string();
+            let node_path = path.join("bin").join("node");
+            Some((
+                parse_node_version_name(version_name.as_str()),
+                version_name,
+                node_path,
+            ))
+        })
+        .collect();
+
+    versioned_paths.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+
+    versioned_paths
+        .into_iter()
+        .map(|(_, _, path)| path)
+        .collect()
+}
+
+fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+
+    for path in paths {
+        let key = path.to_string_lossy().to_string();
+        if key.is_empty() {
+            continue;
+        }
+        if seen.insert(key) {
+            result.push(path);
+        }
+    }
+
+    result
+}
+
+fn known_node_binary_candidates(script_path: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(path) = script_path {
+        if let Some(parent) = path.parent() {
+            candidates.push(parent.join("node"));
+        }
+    }
+
+    if let Some(home) = home_dir() {
+        candidates.push(home.join(".nvm").join("current").join("bin").join("node"));
+        candidates.extend(known_nvm_node_binary_candidates(&home));
+    }
+
+    candidates.push(PathBuf::from("/opt/homebrew/bin/node"));
+    candidates.push(PathBuf::from("/opt/homebrew/opt/node/bin/node"));
+    candidates.push(PathBuf::from("/usr/local/bin/node"));
+    candidates.push(PathBuf::from("/usr/bin/node"));
+    candidates.push(PathBuf::from("/bin/node"));
+
+    dedup_paths(candidates)
+}
+
+fn resolve_node_for_openclaw_script(script_path: &str) -> Option<String> {
+    let node_probe = run_shell("command -v node");
+    if let Some(path) = extract_command_path(&node_probe.stdout) {
+        if Path::new(path.as_str()).is_file() {
+            return Some(path);
+        }
+    }
+
+    let script = Path::new(script_path);
+    first_existing_file_path(&known_node_binary_candidates(Some(script)))
+}
+
+fn known_exec_path_candidates(
+    executable_path: Option<&str>,
+    node_path: Option<&str>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(path) = executable_path {
+        if let Some(parent) = Path::new(path).parent() {
+            candidates.push(parent.to_path_buf());
+        }
+    }
+
+    if let Some(path) = node_path {
+        if let Some(parent) = Path::new(path).parent() {
+            candidates.push(parent.to_path_buf());
+        }
+    }
+
+    if let Some(home) = home_dir() {
+        candidates.push(home.join(".openclaw").join("bin"));
+        candidates.push(home.join(".local").join("bin"));
+        candidates.push(home.join(".nvm").join("current").join("bin"));
+        candidates.extend(
+            known_nvm_node_binary_candidates(&home)
+                .into_iter()
+                .filter_map(|path| path.parent().map(|parent| parent.to_path_buf())),
+        );
+    }
+
+    candidates.push(PathBuf::from("/opt/homebrew/bin"));
+    candidates.push(PathBuf::from("/opt/homebrew/opt/node/bin"));
+    candidates.push(PathBuf::from("/usr/local/bin"));
+    candidates.push(PathBuf::from("/usr/bin"));
+    candidates.push(PathBuf::from("/bin"));
+    candidates.push(PathBuf::from("/usr/sbin"));
+    candidates.push(PathBuf::from("/sbin"));
+
+    dedup_paths(candidates)
+}
+
+fn build_augmented_exec_path(
+    executable_path: Option<&str>,
+    node_path: Option<&str>,
+) -> Option<String> {
+    let mut ordered_paths = Vec::new();
+    let mut seen = HashSet::new();
+
+    for candidate in known_exec_path_candidates(executable_path, node_path) {
+        if !candidate.is_dir() {
+            continue;
+        }
+        let key = candidate.to_string_lossy().to_string();
+        if seen.insert(key) {
+            ordered_paths.push(candidate);
+        }
+    }
+
+    if let Some(base_path) = std::env::var_os("PATH") {
+        for value in std::env::split_paths(&base_path) {
+            let key = value.to_string_lossy().to_string();
+            if key.is_empty() {
+                continue;
+            }
+            if seen.insert(key) {
+                ordered_paths.push(value);
+            }
+        }
+    }
+
+    if ordered_paths.is_empty() {
+        return None;
+    }
+
+    std::env::join_paths(ordered_paths)
+        .ok()
+        .map(|value| value.to_string_lossy().to_string())
+}
+
+fn choose_openclaw_launch_strategy(
+    program: String,
+    node_script_path: Option<String>,
+    node_path: Option<String>,
+) -> OpenclawLaunchStrategy {
+    match (node_script_path, node_path) {
+        (Some(script_path), Some(node_path)) => OpenclawLaunchStrategy::NodeScript {
+            node_path,
+            script_path,
+        },
+        _ => OpenclawLaunchStrategy::Program { program },
+    }
+}
+
+fn resolve_openclaw_execution_context() -> OpenclawExecutionContext {
+    let resolution = resolve_openclaw_executable();
+    let program = openclaw_program(resolution.executable_path.as_deref());
+    let node_script_path = resolution
+        .executable_path
+        .as_deref()
+        .and_then(detect_node_shebang_script_path);
+    let node_path = node_script_path
+        .as_deref()
+        .and_then(resolve_node_for_openclaw_script);
+
+    let strategy = choose_openclaw_launch_strategy(program, node_script_path, node_path.clone());
+    let path_override =
+        build_augmented_exec_path(resolution.executable_path.as_deref(), node_path.as_deref());
+
+    OpenclawExecutionContext {
+        resolution,
+        strategy,
+        path_override,
+    }
+}
+
+fn run_openclaw_command_with_context(
+    context: &OpenclawExecutionContext,
+    args: &[&str],
+) -> ExecOutput {
+    match &context.strategy {
+        OpenclawLaunchStrategy::NodeScript {
+            node_path,
+            script_path,
+        } => {
+            let mut node_args = Vec::with_capacity(args.len() + 1);
+            node_args.push(script_path.as_str());
+            node_args.extend_from_slice(args);
+            run_command_with_path(
+                node_path.as_str(),
+                &node_args,
+                context.path_override.as_deref(),
+            )
+        }
+        OpenclawLaunchStrategy::Program { program } => {
+            let exec =
+                run_command_with_path(program.as_str(), args, context.path_override.as_deref());
+            if should_retry_openclaw_with_fallback(program.as_str(), &exec) {
+                run_command_with_path(OPENCLAW_PROGRAM, args, context.path_override.as_deref())
+            } else {
+                exec
+            }
+        }
     }
 }
 
 fn run_openclaw_command(args: &[&str]) -> ExecOutput {
-    let resolution = resolve_openclaw_executable();
-    run_openclaw_with_preferred_program(resolution.executable_path.as_deref(), args)
+    let context = resolve_openclaw_execution_context();
+    run_openclaw_command_with_context(&context, args)
 }
 
 fn is_allowed_setting(path: &str) -> bool {
@@ -453,16 +749,13 @@ fn open_url(url: &str) -> ExecOutput {
 
 #[tauri::command]
 fn detect_openclaw() -> CommandResponse {
-    let resolution = resolve_openclaw_executable();
+    let context = resolve_openclaw_execution_context();
+    let resolution = &context.resolution;
     let install_dir = first_existing_dir_path(&known_openclaw_install_dirs());
     let program = openclaw_program(resolution.executable_path.as_deref());
 
-    let version =
-        run_openclaw_with_preferred_program(resolution.executable_path.as_deref(), &["--version"]);
-    let config_file = run_openclaw_with_preferred_program(
-        resolution.executable_path.as_deref(),
-        &["config", "file"],
-    );
+    let version = run_openclaw_command_with_context(&context, &["--version"]);
+    let config_file = run_openclaw_command_with_context(&context, &["config", "file"]);
 
     let version_text = extract_version_text(&version.stdout);
     let config_file_path = if config_file.exit_code == 0 {
@@ -566,6 +859,23 @@ fn detect_openclaw() -> CommandResponse {
             stderr_lines.push(format!("fallback_path: {path}"));
         }
     }
+    match &context.strategy {
+        OpenclawLaunchStrategy::Program {
+            program: resolved_program,
+        } => {
+            if resolved_program != &program {
+                stderr_lines.push(format!("execution_program: {resolved_program}"));
+            }
+        }
+        OpenclawLaunchStrategy::NodeScript {
+            node_path,
+            script_path: _,
+        } => {
+            stderr_lines.push("execution_mode: node_script".to_string());
+            stderr_lines.push(format!("resolved_node: {node_path}"));
+        }
+    }
+
     CommandResponse {
         success,
         stdout: stdout_lines.join("\n"),
@@ -644,6 +954,7 @@ fn get_config_file() -> CommandResponse {
 
 #[tauri::command]
 fn get_common_settings() -> CommandResponse {
+    let context = resolve_openclaw_execution_context();
     let mut parsed_settings = Map::new();
     let mut stdout_lines = Vec::new();
     let mut stderr_lines = Vec::new();
@@ -651,7 +962,7 @@ fn get_common_settings() -> CommandResponse {
     let mut success = true;
 
     for path in COMMON_SETTING_PATHS {
-        let exec = run_openclaw_command(&["config", "get", path]);
+        let exec = run_openclaw_command_with_context(&context, &["config", "get", path]);
         if exec.exit_code == 0 {
             let value = extract_config_get_value(path, &exec.stdout);
             parsed_settings.insert(path.to_string(), Value::String(value.clone()));
@@ -858,6 +1169,63 @@ openclaw is /opt/homebrew/bin/openclaw
             "/opt/homebrew/bin/openclaw",
             &exec
         ));
+    }
+
+    #[test]
+    fn detects_env_node_shebang() {
+        assert!(shebang_uses_env_node("#!/usr/bin/env node"));
+        assert!(shebang_uses_env_node(
+            "#!/usr/bin/env -S node --trace-warnings"
+        ));
+        assert!(!shebang_uses_env_node("#!/bin/bash"));
+    }
+
+    #[test]
+    fn chooses_node_script_launch_when_node_is_resolved() {
+        let strategy = choose_openclaw_launch_strategy(
+            "/opt/homebrew/bin/openclaw".to_string(),
+            Some("/opt/homebrew/bin/openclaw".to_string()),
+            Some("/opt/homebrew/bin/node".to_string()),
+        );
+        assert_eq!(
+            strategy,
+            OpenclawLaunchStrategy::NodeScript {
+                node_path: "/opt/homebrew/bin/node".to_string(),
+                script_path: "/opt/homebrew/bin/openclaw".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn falls_back_to_program_launch_when_node_missing_for_script() {
+        let base =
+            std::env::temp_dir().join(format!("clawset-test-node-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("create temp dir");
+
+        let script = base.join("openclaw");
+        std::fs::write(&script, "#!/usr/bin/env node\nconsole.log('ok')\n").expect("create script");
+
+        let script_path = detect_node_shebang_script_path(script.to_string_lossy().as_ref());
+        assert_eq!(
+            script_path,
+            Some(script.to_string_lossy().to_string()),
+            "test script should be recognized as env node script"
+        );
+
+        let strategy = choose_openclaw_launch_strategy(
+            script.to_string_lossy().to_string(),
+            script_path,
+            None,
+        );
+        assert_eq!(
+            strategy,
+            OpenclawLaunchStrategy::Program {
+                program: script.to_string_lossy().to_string(),
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
