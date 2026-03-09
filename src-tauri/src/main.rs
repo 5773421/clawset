@@ -7,6 +7,17 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const OPENCLAW_PROGRAM: &str = "openclaw";
+const OPENCLAW_ONBOARD_ARGS: [&str; 9] = [
+    "onboard",
+    "--install-daemon",
+    "--accept-risk",
+    "--non-interactive",
+    "--skip-channels",
+    "--skip-search",
+    "--skip-skills",
+    "--skip-ui",
+    "--json",
+];
 
 #[derive(Debug, Clone)]
 struct ExecOutput {
@@ -503,6 +514,10 @@ fn clean_non_empty_lines(text: &str) -> Vec<String> {
         .filter(|line| !line.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn first_non_empty_cli_line(text: &str) -> Option<String> {
+    clean_non_empty_lines(text).into_iter().next()
 }
 
 fn normalize_token(token: &str) -> &str {
@@ -1175,11 +1190,20 @@ fn write_openclaw_provider(
 
 #[tauri::command]
 fn run_openclaw_onboard() -> CommandResponse {
-    let exec = run_openclaw_command(&["onboard", "--install-daemon", "--no-prompt"]);
+    let exec = run_openclaw_command(&OPENCLAW_ONBOARD_ARGS);
+    let parsed_json = serde_json::from_str::<Value>(&exec.stdout).ok();
+
     let mut response = CommandResponse::from_exec(exec, "OpenClaw onboard command completed");
-    if !response.success {
-        response.message = "OpenClaw onboard failed".to_string();
+    response.parsed_json = parsed_json;
+
+    if response.success {
+        response.message = "OpenClaw onboard completed".to_string();
+        return response;
     }
+
+    response.message = first_non_empty_cli_line(&response.stderr)
+        .or_else(|| first_non_empty_cli_line(&response.stdout))
+        .unwrap_or_else(|| "OpenClaw onboard failed".to_string());
     response
 }
 
@@ -1191,6 +1215,23 @@ mod tests {
     fn strip_ansi_preserves_utf8_content() {
         let raw = "\u{1b}[32m路径: ~/.openclaw/openclaw.json\u{1b}[0m";
         assert_eq!(strip_ansi_sequences(raw), "路径: ~/.openclaw/openclaw.json");
+    }
+
+    #[test]
+    fn picks_first_non_empty_cli_line() {
+        let raw = "\n\nfirst useful line\nsecond line";
+        assert_eq!(
+            first_non_empty_cli_line(raw),
+            Some("first useful line".to_string())
+        );
+    }
+
+    #[test]
+    fn onboard_args_use_non_interactive_json_flow() {
+        assert!(OPENCLAW_ONBOARD_ARGS.contains(&"--non-interactive"));
+        assert!(OPENCLAW_ONBOARD_ARGS.contains(&"--accept-risk"));
+        assert!(OPENCLAW_ONBOARD_ARGS.contains(&"--json"));
+        assert!(!OPENCLAW_ONBOARD_ARGS.contains(&"--no-prompt"));
     }
 
     #[test]
