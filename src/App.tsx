@@ -7,9 +7,15 @@ import {
   getConfigFile,
   installOpenclaw,
   openDashboard,
+  readOpenclawConfig,
+  readOpenclawProviders,
+  runOpenclawOnboard,
   setCommonSetting,
+  writeOpenclawChannel,
+  writeOpenclawProvider,
 } from "./lib/tauri";
 import type {
+  ChannelType,
   CommandResponse,
   CommonSettings,
   GatewayAction,
@@ -20,26 +26,30 @@ type NoticeKind = "success" | "error" | "info";
 type Locale = "zh-CN" | "en-US";
 type AppView = "language-select" | "onboarding" | "dashboard";
 type OnboardingStepState = "done" | "active" | "pending";
+type RequiredCheckKey =
+  | "cliInstalled"
+  | "configExists"
+  | "providerConfigured"
+  | "daemonInstalled"
+  | "gatewayListening"
+  | "rpcConnected";
 type HomeStatus =
   | "not-installed"
   | "installed-not-started"
   | "starting"
   | "service-error"
   | "console-ready";
+
 type HomeAction =
   | "install"
+  | "save-provider"
+  | "run-onboard"
   | "start"
   | "stop"
   | "restart"
   | "refresh-status"
   | "refresh-all"
   | "open-dashboard";
-type DashboardIssueKind =
-  | "gateway-not-ready"
-  | "dashboard-command-failed"
-  | "url-missing"
-  | "open-url-failed"
-  | "unknown";
 
 interface Notice {
   kind: NoticeKind;
@@ -68,28 +78,46 @@ interface OnboardingStep {
   state: OnboardingStepState;
 }
 
-interface DashboardAttempt {
-  response: CommandResponse;
-  at: string;
+interface SetupChecks {
+  cliInstalled: boolean;
+  configExists: boolean;
+  providerConfigured: boolean;
+  daemonInstalled: boolean;
+  gatewayListening: boolean;
+  rpcConnected: boolean;
 }
 
 interface GatewayInsight {
-  running: boolean | null;
-  healthy: boolean | null;
-  stoppedHint: boolean;
+  daemonInstalled: boolean | null;
+  gatewayListening: boolean | null;
+  rpcConnected: boolean | null;
   hasError: boolean;
   summary: string;
 }
 
-interface DashboardIssue {
-  kind: DashboardIssueKind;
-  detail: string;
+interface ChannelSnapshot {
+  telegramConfigured: boolean;
+  feishuConfigured: boolean;
+}
+
+interface ProviderFormState {
+  providerName: string;
+  baseUrl: string;
+  apiKey: string;
+  api: string;
+  defaultModel: string;
+}
+
+interface TelegramFormState {
+  botToken: string;
+}
+
+interface FeishuFormState {
+  appId: string;
+  appSecret: string;
 }
 
 const LOCALE_STORAGE_KEY = "clawset.locale";
-const INSTALL_STABILIZE_POLL_ATTEMPTS = 8;
-const INSTALL_STABILIZE_POLL_INTERVAL_MS = 1200;
-const INSTALL_STABLE_SUCCESS_TARGET = 2;
 
 const DEFAULT_SETTINGS: CommonSettings = {
   "update.channel": "",
@@ -100,113 +128,162 @@ const DEFAULT_SETTINGS: CommonSettings = {
   "agents.defaults.heartbeat.every": "",
 };
 
+const DEFAULT_PROVIDER_FORM: ProviderFormState = {
+  providerName: "openai",
+  baseUrl: "https://api.openai.com/v1",
+  apiKey: "",
+  api: "openai",
+  defaultModel: "gpt-4o-mini",
+};
+
+const REQUIRED_CHECK_ORDER: RequiredCheckKey[] = [
+  "cliInstalled",
+  "configExists",
+  "providerConfigured",
+  "daemonInstalled",
+  "gatewayListening",
+  "rpcConnected",
+];
+
 const I18N = {
   "zh-CN": {
     appTitle: "Clawset Desktop",
-    appSubtitle: "OpenClaw 引导与控制台",
-    noticeReady: "就绪",
-    noticeRefreshing: "正在刷新状态...",
-    noticeRefreshed: "状态已刷新",
-    noticeNeedInstall: "未检测到 OpenClaw，请先完成安装",
-    noticeNeedGateway: "OpenClaw 已安装，但基础状态暂不可用",
-    noticeInstallPendingRefresh: "安装命令已完成，正在等待状态稳定...",
-    noticeInstallDetectTimeout: "安装命令已完成，但状态尚未稳定。请稍后点击“重新检测”。",
-    noticeCurrentStatus: "当前状态",
-    lastUpdated: "最后刷新",
-    running: "执行中",
+    appSubtitle: "OpenClaw Setup Wizard v2",
     language: "语言",
+    running: "执行中",
+    lastUpdated: "最后刷新",
+    noticeReady: "就绪",
+    noticeRefreshing: "正在刷新 setup 状态...",
+    noticeRefreshed: "setup 状态已刷新",
+    noticeNeedInstall: "未检测到 OpenClaw，请先安装。",
+    noticeNeedProvider: "请先至少配置一个 Provider。",
+    noticeNeedRuntime: "请完成 daemon / gateway / RPC 初始化。",
     languageTitle: "选择语言",
     languageDescription: "首次使用请选择界面语言。默认简体中文，后续可随时切换。",
     languageConfirm: "继续",
     languageChinese: "简体中文",
     languageEnglish: "English",
-    onboardingTitle: "首次使用引导",
+    onboardingTitle: "Setup Wizard v2",
     onboardingDescription:
-      "检测到环境尚未就绪。请按步骤完成检测、安装、启动与验证。",
-    onboardingProgress: "引导进度",
-    stepDetectTitle: "检测 OpenClaw",
-    stepDetectDescription: "检查命令、版本、路径与配置文件位置。",
-    stepInstallTitle: "安装 OpenClaw",
-    stepInstallDescription: "未安装时执行安装脚本并记录输出日志。",
-    stepStartTitle: "启动 Gateway",
-    stepStartDescription: "调用 Gateway 启动命令并等待服务进入可用状态。",
-    stepVerifyTitle: "验证基础状态",
-    stepVerifyDescription: "检查 Gateway 状态输出，确认可进入控制面板。",
+      "只有在 CLI 已安装、配置文件存在、至少一个 provider 已配置、daemon 已安装、gateway 正在监听、RPC 可连接时，环境才算 Ready。",
+    onboardingProgress: "必需项进度",
+    onboardingMissing: "当前缺失项",
+    onboardingAllDone: "所有必需项已满足，可以进入首页。",
+    setupChecksTitle: "就绪检查",
+    setupCheckCli: "CLI 已安装",
+    setupCheckConfig: "配置文件存在",
+    setupCheckProvider: "至少一个 Provider",
+    setupCheckDaemon: "Daemon 已安装",
+    setupCheckGateway: "Gateway 正在监听",
+    setupCheckRpc: "RPC 可连接",
+    setupCheckDone: "已满足",
+    setupCheckPending: "待完成",
+    setupCheckOptional: "可选",
+    stepEnvTitle: "环境探测",
+    stepEnvDescription: "检测 CLI 与配置文件路径。",
+    stepProviderTitle: "Provider 配置",
+    stepProviderDescription: "配置 provider name / base URL / API key / API protocol / default model。",
+    stepChannelTitle: "Channel 配置",
+    stepChannelDescription: "配置 Telegram 或飞书；QQ 先占位。",
+    stepRuntimeTitle: "Runtime 初始化",
+    stepRuntimeDescription: "执行 onboard 并验证 daemon、gateway、RPC。",
     stepDone: "已完成",
     stepActive: "进行中",
     stepPending: "待处理",
-    statusNeedInstall: "未检测到 OpenClaw，请点击“安装 OpenClaw”。",
-    statusNeedGateway: "OpenClaw 已安装，正在等待 Gateway 基础状态可用。",
-    statusReady: "OpenClaw 与基础状态均可用，可以进入控制面板。",
-    actionRedetect: "重新检测",
+    recommendTitle: "推荐下一步",
+    recommendInstall: "先安装 OpenClaw",
+    recommendRefreshConfig: "重新检测配置文件",
+    recommendProvider: "保存 Provider 配置",
+    recommendRuntime: "执行 OpenClaw Onboard",
+    recommendReady: "进入首页",
+    actionsTitle: "操作",
+    actionPrimary: "主要操作",
+    actionSecondary: "次要操作",
+    actionRefreshAll: "刷新全部",
+    actionRefreshingAll: "刷新中...",
     actionInstall: "安装 OpenClaw",
     actionInstalling: "安装中...",
+    actionRunOnboard: "运行 Onboard",
+    actionRunningOnboard: "Onboard 中...",
     actionStartGateway: "启动 Gateway",
     actionStartingGateway: "启动中...",
-    actionRefreshStatus: "刷新基础状态",
+    actionRefreshStatus: "刷新 Gateway 状态",
     actionRefreshingStatus: "刷新中...",
+    actionOpenDashboard: "打开 Dashboard",
+    actionOpeningDashboard: "打开中...",
+    actionStart: "启动",
+    actionStop: "停止",
+    actionRestart: "重启",
+    actionStopping: "停止中...",
+    actionRestarting: "重启中...",
+    setupProviderTitle: "Provider 配置",
+    setupProviderHint: "至少保存一个 provider，Ready 校验才会通过。",
+    providerName: "Provider Name",
+    providerBaseUrl: "Base URL",
+    providerApiKey: "API Key",
+    providerApiProtocol: "API Protocol",
+    providerDefaultModel: "Default Model",
+    actionSaveProvider: "保存 Provider",
+    actionSavingProvider: "保存中...",
+    providerConfiguredCount: "已配置 Provider 数量",
+    setupChannelTitle: "Channel 配置",
+    setupChannelHint: "支持 Telegram 与飞书。QQ 当前仅展示官方接入入口。",
+    channelTelegram: "Telegram",
+    channelFeishu: "飞书",
+    channelQq: "QQ（占位）",
+    channelBotToken: "Bot Token",
+    channelAppId: "App ID",
+    channelAppSecret: "App Secret",
+    actionSaveTelegram: "保存 Telegram",
+    actionSaveFeishu: "保存飞书",
+    actionSavingChannel: "保存中...",
+    channelConfigured: "已配置",
+    channelNotConfigured: "未配置",
+    qqPlaceholderText: "QQ 渠道正在接入中，请先参考官方接入文档。",
+    qqPlaceholderLink: "打开 QQ 官方接入说明",
     overviewTitle: "环境概览",
     overviewInstallStatus: "OpenClaw 安装状态",
-    overviewGatewayBaseStatus: "Gateway 基础状态",
-    overviewGatewayReady: "可用",
-    overviewGatewayNotReady: "不可用",
+    overviewGatewayStatus: "Gateway 监听状态",
+    overviewRpcStatus: "RPC 连通状态",
     overviewInstalled: "已安装",
     overviewNotInstalled: "未安装",
+    overviewReady: "可用",
+    overviewNotReady: "不可用",
     overviewVersion: "版本",
     overviewPath: "路径",
     overviewConfigFile: "配置文件",
     outputTitle: "最新命令输出",
     outputHistoryTitle: "执行记录",
     outputEmpty: "(空)",
-    dashboardTitle: "控制面板",
     homeTitle: "首页",
-    homeSubtitle: "面向普通用户的 OpenClaw 控制中心",
+    homeSubtitle: "OpenClaw 控制中心",
     homeStatusTitle: "当前环境状态",
     homeServiceTitle: "服务状态",
     homeNextStepTitle: "下一步建议",
     homeQuickActionsTitle: "其他操作",
+    statusHumanNotInstalled: "未安装",
+    statusHumanInstalledNotStarted: "已安装未就绪",
+    statusHumanStarting: "初始化中",
+    statusHumanServiceError: "服务异常",
+    statusHumanReady: "Ready",
+    statusExplainNotInstalled: "当前设备未检测到 OpenClaw。",
+    statusExplainInstalledNotStarted: "OpenClaw 已安装，但 daemon/gateway/RPC 尚未全部就绪。",
+    statusExplainStarting: "正在等待安装或运行时初始化完成。",
+    statusExplainServiceError: "运行状态异常，建议重试 onboard 并刷新状态。",
+    statusExplainReady: "全部检查通过，可继续使用 Dashboard。",
+    nextInstall: "先安装 OpenClaw。",
+    nextProvider: "先完成 Provider 配置。",
+    nextRuntime: "执行 Onboard，等待 daemon/gateway/RPC 就绪。",
+    nextOpenDashboard: "打开 Dashboard 开始使用。",
     homeAdvancedDiagnostics: "高级诊断",
     homeAdvancedDiagnosticsHint: "包含原始 JSON 与底层输出，默认折叠。",
-    homeAdvancedSettings: "高级设置",
-    homeAdvancedSettingsHint: "仅在需要时修改常用配置。",
-    statusHumanNotInstalled: "未安装",
-    statusHumanInstalledNotStarted: "已安装未启动",
-    statusHumanStarting: "启动中",
-    statusHumanServiceError: "服务异常",
-    statusHumanReady: "可以进入控制台",
-    statusExplainNotInstalled: "当前设备未检测到 OpenClaw，安装后才能启动服务。",
-    statusExplainInstalledNotStarted: "OpenClaw 已安装，但服务尚未在运行。",
-    statusExplainStarting: "正在等待服务完成启动和状态同步。",
-    statusExplainServiceError: "服务状态异常，建议先重启服务并刷新状态。",
-    statusExplainReady: "服务已可用，可以打开控制台继续操作。",
-    nextInstall: "先安装 OpenClaw。安装完成后会自动再次检测。",
-    nextStart: "先启动服务，然后再进入控制台。",
-    nextStarting: "等待几秒后刷新状态，确认服务是否已就绪。",
-    nextRecover: "先重启服务；如果仍异常，请查看高级诊断。",
-    nextOpenDashboard: "打开 Dashboard 开始使用。",
-    dashboardIssueTitle: "Dashboard 打不开怎么办？",
-    dashboardIssueGatewayNotReady: "服务还没准备好，暂时无法打开 Dashboard。",
-    dashboardIssueCommandFailed: "获取 Dashboard 地址失败。",
-    dashboardIssueUrlMissing: "命令执行成功，但没有返回可打开的地址。",
-    dashboardIssueOpenFailed: "已拿到地址，但系统没有成功打开浏览器。",
-    dashboardIssueUnknown: "打开 Dashboard 时发生未知问题。",
-    dashboardIssueSuggestionA: "建议：先点击“刷新基础状态”，确认服务可用。",
-    dashboardIssueSuggestionB: "建议：再试一次“打开 Dashboard”；若仍失败，请查看高级诊断。",
-    dashboardIssueSuggestionC: "建议：复制下方地址到浏览器手动打开。",
-    dashboardIssueSuggestionD: "建议：重启服务后再重试。",
-    dashboardIssueLastAttempt: "最近尝试",
-    dashboardUrlLabel: "Dashboard 地址",
-    diagnosticsStructuredStatus: "结构化状态",
+    diagnosticsStructuredStatus: "Gateway 结构化状态",
     diagnosticsRawGateway: "Gateway 原始输出",
     diagnosticsLastCommand: "最近命令输出",
     diagnosticsHistory: "执行历史",
     diagnosticsNone: "暂无结构化状态，已保留原始输出。",
-    actionPrimary: "主要操作",
-    actionSecondary: "次要操作",
-    actionsTitle: "操作",
-    gatewayStatusTitle: "Gateway 状态",
-    rawOutput: "原始输出",
-    rawParseFallback: "无法解析 JSON，已展示原始输出。",
+    homeAdvancedSettings: "高级设置",
+    homeAdvancedSettingsHint: "仅在需要时修改常用配置。",
     settingsTitle: "Settings",
     settingsReload: "刷新配置",
     settingsReloading: "刷新中...",
@@ -216,133 +293,156 @@ const I18N = {
     settingsSavingOne: "保存中...",
     fieldBooleanTrue: "true",
     fieldBooleanFalse: "false",
-    actionOpenDashboard: "打开 Dashboard",
-    actionOpeningDashboard: "打开中...",
-    actionStart: "启动",
-    actionStarting: "启动中...",
-    actionStop: "停止",
-    actionStopping: "停止中...",
-    actionRestart: "重启",
-    actionRestarting: "重启中...",
-    actionRefreshAll: "刷新全部",
-    actionRefreshingAll: "刷新中...",
-    savePartialFail: "部分设置保存失败",
     saveAllSuccess: "全部设置已保存",
+    savePartialFail: "部分设置保存失败",
     commandFailed: "命令执行失败",
+    noticeCurrentStatus: "当前状态",
     logDetect: "检测 OpenClaw",
-    logConfig: "读取配置文件路径",
+    logConfigFile: "读取配置文件路径",
+    logConfigJson: "读取 OpenClaw 配置",
+    logProviders: "读取 Provider 列表",
     logGatewayStatus: "读取 Gateway 状态",
     logSettings: "读取常用配置",
   },
   "en-US": {
     appTitle: "Clawset Desktop",
-    appSubtitle: "OpenClaw onboarding and control panel",
-    noticeReady: "Ready",
-    noticeRefreshing: "Refreshing status...",
-    noticeRefreshed: "Status refreshed",
-    noticeNeedInstall: "OpenClaw was not detected. Install it first.",
-    noticeNeedGateway: "OpenClaw is installed, but base status is not ready yet.",
-    noticeInstallPendingRefresh: "Install command finished. Waiting for status to stabilize...",
-    noticeInstallDetectTimeout:
-      "Install command finished, but status is not stable yet. Try Re-detect shortly.",
-    noticeCurrentStatus: "Current status",
-    lastUpdated: "Last Updated",
-    running: "Running",
+    appSubtitle: "OpenClaw Setup Wizard v2",
     language: "Language",
+    running: "Running",
+    lastUpdated: "Last Updated",
+    noticeReady: "Ready",
+    noticeRefreshing: "Refreshing setup status...",
+    noticeRefreshed: "Setup status refreshed",
+    noticeNeedInstall: "OpenClaw is not detected. Install it first.",
+    noticeNeedProvider: "Please configure at least one provider.",
+    noticeNeedRuntime: "Please finish daemon / gateway / RPC initialization.",
     languageTitle: "Choose Language",
-    languageDescription:
-      "Choose your UI language on first launch. You can change it later.",
+    languageDescription: "Choose your UI language on first launch.",
     languageConfirm: "Continue",
     languageChinese: "简体中文",
     languageEnglish: "English",
-    onboardingTitle: "First-Use Onboarding",
+    onboardingTitle: "Setup Wizard v2",
     onboardingDescription:
-      "The environment is not ready. Complete detection, install, start, and verification steps.",
-    onboardingProgress: "Progress",
-    stepDetectTitle: "Detect OpenClaw",
-    stepDetectDescription: "Check command availability, version, path, and config file.",
-    stepInstallTitle: "Install OpenClaw",
-    stepInstallDescription: "Run install script when OpenClaw is missing and keep output logs.",
-    stepStartTitle: "Start Gateway",
-    stepStartDescription: "Start gateway and wait for base status to become ready.",
-    stepVerifyTitle: "Verify Base Status",
-    stepVerifyDescription: "Check gateway status output before entering dashboard.",
+      "Ready only when CLI is installed + config exists + at least one provider + daemon installed + gateway listening + RPC reachable.",
+    onboardingProgress: "Required Progress",
+    onboardingMissing: "Missing checks",
+    onboardingAllDone: "All required checks passed. You can enter Home.",
+    setupChecksTitle: "Readiness Checks",
+    setupCheckCli: "CLI Installed",
+    setupCheckConfig: "Config Exists",
+    setupCheckProvider: "At Least 1 Provider",
+    setupCheckDaemon: "Daemon Installed",
+    setupCheckGateway: "Gateway Listening",
+    setupCheckRpc: "RPC Reachable",
+    setupCheckDone: "Done",
+    setupCheckPending: "Pending",
+    setupCheckOptional: "Optional",
+    stepEnvTitle: "Environment Detection",
+    stepEnvDescription: "Detect CLI and config file path.",
+    stepProviderTitle: "Provider Configuration",
+    stepProviderDescription: "Configure provider name / base URL / API key / API protocol / default model.",
+    stepChannelTitle: "Channel Configuration",
+    stepChannelDescription: "Configure Telegram or Feishu; QQ is placeholder for now.",
+    stepRuntimeTitle: "Runtime Initialization",
+    stepRuntimeDescription: "Run onboard and verify daemon, gateway, and RPC.",
     stepDone: "Done",
     stepActive: "Active",
     stepPending: "Pending",
-    statusNeedInstall: "OpenClaw is not installed. Click Install OpenClaw.",
-    statusNeedGateway: "OpenClaw is installed, waiting for gateway base status.",
-    statusReady: "OpenClaw and base status are ready. Dashboard is available.",
-    actionRedetect: "Re-detect",
+    recommendTitle: "Recommended Next Step",
+    recommendInstall: "Install OpenClaw first",
+    recommendRefreshConfig: "Re-check config file",
+    recommendProvider: "Save provider configuration",
+    recommendRuntime: "Run OpenClaw onboard",
+    recommendReady: "Enter home",
+    actionsTitle: "Actions",
+    actionPrimary: "Primary",
+    actionSecondary: "Secondary",
+    actionRefreshAll: "Refresh All",
+    actionRefreshingAll: "Refreshing...",
     actionInstall: "Install OpenClaw",
     actionInstalling: "Installing...",
+    actionRunOnboard: "Run Onboard",
+    actionRunningOnboard: "Running Onboard...",
     actionStartGateway: "Start Gateway",
     actionStartingGateway: "Starting...",
-    actionRefreshStatus: "Refresh Base Status",
+    actionRefreshStatus: "Refresh Gateway Status",
     actionRefreshingStatus: "Refreshing...",
+    actionOpenDashboard: "Open Dashboard",
+    actionOpeningDashboard: "Opening...",
+    actionStart: "Start",
+    actionStop: "Stop",
+    actionRestart: "Restart",
+    actionStopping: "Stopping...",
+    actionRestarting: "Restarting...",
+    setupProviderTitle: "Provider Configuration",
+    setupProviderHint: "At least one saved provider is required for Ready.",
+    providerName: "Provider Name",
+    providerBaseUrl: "Base URL",
+    providerApiKey: "API Key",
+    providerApiProtocol: "API Protocol",
+    providerDefaultModel: "Default Model",
+    actionSaveProvider: "Save Provider",
+    actionSavingProvider: "Saving...",
+    providerConfiguredCount: "Configured Providers",
+    setupChannelTitle: "Channel Configuration",
+    setupChannelHint: "Telegram and Feishu are supported. QQ is currently a placeholder.",
+    channelTelegram: "Telegram",
+    channelFeishu: "Feishu",
+    channelQq: "QQ (Placeholder)",
+    channelBotToken: "Bot Token",
+    channelAppId: "App ID",
+    channelAppSecret: "App Secret",
+    actionSaveTelegram: "Save Telegram",
+    actionSaveFeishu: "Save Feishu",
+    actionSavingChannel: "Saving...",
+    channelConfigured: "Configured",
+    channelNotConfigured: "Not configured",
+    qqPlaceholderText: "QQ channel integration is in progress. Please use the official guide.",
+    qqPlaceholderLink: "Open QQ official integration page",
     overviewTitle: "Environment Overview",
     overviewInstallStatus: "OpenClaw Install",
-    overviewGatewayBaseStatus: "Gateway Base Status",
-    overviewGatewayReady: "Ready",
-    overviewGatewayNotReady: "Not Ready",
+    overviewGatewayStatus: "Gateway Listening",
+    overviewRpcStatus: "RPC Connectivity",
     overviewInstalled: "Installed",
     overviewNotInstalled: "Not Installed",
+    overviewReady: "Ready",
+    overviewNotReady: "Not Ready",
     overviewVersion: "Version",
     overviewPath: "Path",
     overviewConfigFile: "Config File",
     outputTitle: "Latest Command Output",
     outputHistoryTitle: "Execution History",
     outputEmpty: "(empty)",
-    dashboardTitle: "Dashboard",
     homeTitle: "Home",
-    homeSubtitle: "OpenClaw control center for regular users",
-    homeStatusTitle: "Environment Status",
-    homeServiceTitle: "Service Status",
-    homeNextStepTitle: "Recommended Next Step",
+    homeSubtitle: "OpenClaw control center",
+    homeStatusTitle: "Environment",
+    homeServiceTitle: "Service",
+    homeNextStepTitle: "Next Suggestion",
     homeQuickActionsTitle: "Other Actions",
-    homeAdvancedDiagnostics: "Advanced Diagnostics",
-    homeAdvancedDiagnosticsHint: "Contains raw JSON and low-level outputs. Collapsed by default.",
-    homeAdvancedSettings: "Advanced Settings",
-    homeAdvancedSettingsHint: "Edit common settings only when needed.",
     statusHumanNotInstalled: "Not installed",
-    statusHumanInstalledNotStarted: "Installed, not started",
-    statusHumanStarting: "Starting",
+    statusHumanInstalledNotStarted: "Installed, not ready",
+    statusHumanStarting: "Initializing",
     statusHumanServiceError: "Service error",
-    statusHumanReady: "Console ready",
-    statusExplainNotInstalled: "OpenClaw is not detected on this device yet.",
-    statusExplainInstalledNotStarted: "OpenClaw is installed, but the service is not running.",
-    statusExplainStarting: "Waiting for service startup and status synchronization.",
-    statusExplainServiceError: "Service status is abnormal. Restart and refresh status first.",
-    statusExplainReady: "Service is available. You can open the dashboard now.",
-    nextInstall: "Install OpenClaw first. Status will be checked again automatically.",
-    nextStart: "Start the service first, then enter the dashboard.",
-    nextStarting: "Wait a few seconds and refresh status to confirm readiness.",
-    nextRecover: "Restart service first. If it still fails, check Advanced Diagnostics.",
+    statusHumanReady: "Ready",
+    statusExplainNotInstalled: "OpenClaw is not detected on this machine.",
+    statusExplainInstalledNotStarted:
+      "OpenClaw is installed, but daemon/gateway/RPC are not fully ready.",
+    statusExplainStarting: "Waiting for installation or runtime initialization.",
+    statusExplainServiceError: "Runtime status is abnormal. Retry onboard and refresh status.",
+    statusExplainReady: "All checks passed. Dashboard is available.",
+    nextInstall: "Install OpenClaw first.",
+    nextProvider: "Configure a provider first.",
+    nextRuntime: "Run onboard and wait for daemon/gateway/RPC.",
     nextOpenDashboard: "Open Dashboard to continue.",
-    dashboardIssueTitle: "Dashboard cannot open?",
-    dashboardIssueGatewayNotReady: "Service is not ready yet, so Dashboard is unavailable.",
-    dashboardIssueCommandFailed: "Failed to fetch Dashboard URL.",
-    dashboardIssueUrlMissing: "Command succeeded but no openable URL was returned.",
-    dashboardIssueOpenFailed: "URL was found, but the system could not open the browser.",
-    dashboardIssueUnknown: "An unknown issue occurred while opening Dashboard.",
-    dashboardIssueSuggestionA: "Try Refresh Base Status first to confirm service availability.",
-    dashboardIssueSuggestionB:
-      "Try Open Dashboard again. If it still fails, check Advanced Diagnostics.",
-    dashboardIssueSuggestionC: "Copy the URL below and open it manually in your browser.",
-    dashboardIssueSuggestionD: "Restart service and try again.",
-    dashboardIssueLastAttempt: "Last attempt",
-    dashboardUrlLabel: "Dashboard URL",
-    diagnosticsStructuredStatus: "Structured status",
+    homeAdvancedDiagnostics: "Advanced Diagnostics",
+    homeAdvancedDiagnosticsHint: "Contains raw JSON and low-level output. Collapsed by default.",
+    diagnosticsStructuredStatus: "Structured gateway status",
     diagnosticsRawGateway: "Gateway raw output",
     diagnosticsLastCommand: "Latest command output",
     diagnosticsHistory: "Execution history",
-    diagnosticsNone: "No structured status available yet. Raw output is kept below.",
-    actionPrimary: "Primary action",
-    actionSecondary: "Secondary action",
-    actionsTitle: "Actions",
-    gatewayStatusTitle: "Gateway Status",
-    rawOutput: "Raw output",
-    rawParseFallback: "JSON parsing failed. Showing raw output.",
+    diagnosticsNone: "No structured status yet. Raw output is preserved.",
+    homeAdvancedSettings: "Advanced Settings",
+    homeAdvancedSettingsHint: "Edit common settings only when needed.",
     settingsTitle: "Settings",
     settingsReload: "Reload Settings",
     settingsReloading: "Reloading...",
@@ -352,21 +452,14 @@ const I18N = {
     settingsSavingOne: "Saving...",
     fieldBooleanTrue: "true",
     fieldBooleanFalse: "false",
-    actionOpenDashboard: "Open Dashboard",
-    actionOpeningDashboard: "Opening...",
-    actionStart: "Start",
-    actionStarting: "Starting...",
-    actionStop: "Stop",
-    actionStopping: "Stopping...",
-    actionRestart: "Restart",
-    actionRestarting: "Restarting...",
-    actionRefreshAll: "Refresh All",
-    actionRefreshingAll: "Refreshing...",
-    savePartialFail: "Some settings failed to save",
     saveAllSuccess: "All settings saved",
+    savePartialFail: "Some settings failed to save",
     commandFailed: "Command execution failed",
+    noticeCurrentStatus: "Current status",
     logDetect: "Detect OpenClaw",
-    logConfig: "Read config file path",
+    logConfigFile: "Read config file path",
+    logConfigJson: "Read OpenClaw config",
+    logProviders: "Read providers",
     logGatewayStatus: "Read gateway status",
     logSettings: "Read common settings",
   },
@@ -453,9 +546,33 @@ function readStoredLocale(): Locale | null {
   return null;
 }
 
+function toText(value: unknown): string {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return JSON.stringify(value);
+}
+
 function firstLine(text: string): string {
   const line = text.trim().split(/\r?\n/)[0];
   return line || "-";
+}
+
+function toErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function normalizeDetectValue(value: string): string {
@@ -524,37 +641,7 @@ function inferInstalledFromDetect(response: CommandResponse, detect: DetectSumma
     return detect.installed;
   }
 
-  return (
-    response.success ||
-    hasDetectSignal(detect.path) ||
-    hasDetectSignal(detect.configFile) ||
-    hasDetectSignal(detect.installDir) ||
-    hasDetectSignal(detect.version)
-  );
-}
-
-function toText(value: unknown): string {
-  if (value === null || value === undefined) {
-    return "";
-  }
-  if (typeof value === "string") {
-    return value;
-  }
-  if (typeof value === "number" || typeof value === "boolean") {
-    return String(value);
-  }
-  return JSON.stringify(value);
-}
-
-function toErrorMessage(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message;
-  }
-  return String(error);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+  return response.success || hasDetectSignal(detect.path) || hasDetectSignal(detect.version);
 }
 
 function normalizeBoolean(value: string): "true" | "false" {
@@ -594,7 +681,9 @@ function toBooleanSignal(value: unknown): boolean | null {
     normalized === "ready" ||
     normalized === "healthy" ||
     normalized === "ok" ||
-    normalized === "up"
+    normalized === "up" ||
+    normalized === "connected" ||
+    normalized === "listening"
   ) {
     return true;
   }
@@ -606,7 +695,8 @@ function toBooleanSignal(value: unknown): boolean | null {
     normalized === "down" ||
     normalized === "failed" ||
     normalized === "error" ||
-    normalized === "not running"
+    normalized === "not running" ||
+    normalized === "disconnected"
   ) {
     return false;
   }
@@ -629,219 +719,174 @@ function collectObjectSignals(
   return output;
 }
 
+function signalFromParsed(
+  signals: Array<{ key: string; value: unknown }>,
+  keyTokens: string[],
+  positiveTokens: string[],
+  negativeTokens: string[],
+): boolean | null {
+  for (const signal of signals) {
+    const key = signal.key.toLowerCase();
+    if (!keyTokens.some((token) => key.includes(token))) {
+      continue;
+    }
+
+    const boolSignal = toBooleanSignal(signal.value);
+    if (boolSignal !== null) {
+      return boolSignal;
+    }
+
+    const text = toText(signal.value).toLowerCase();
+    if (containsToken(text, negativeTokens)) {
+      return false;
+    }
+    if (containsToken(text, positiveTokens)) {
+      return true;
+    }
+  }
+
+  return null;
+}
+
 function analyzeGatewayInsight(
   response: CommandResponse | null,
   parsed: Record<string, unknown> | null,
   raw: string,
 ): GatewayInsight {
-  const RUNNING_TOKENS = ["running", "active", "started", "ready", "listening", "online"];
-  const STOPPED_TOKENS = [
-    "not running",
-    "stopped",
-    "inactive",
-    "not started",
-    "offline",
-    "down",
-  ];
-  const ERROR_TOKENS = ["error", "failed", "exception", "panic", "timeout"];
-
   const signals = parsed ? collectObjectSignals(parsed) : [];
-  let running: boolean | null = null;
-  let healthy: boolean | null = null;
-  let summary = "";
 
-  for (const signal of signals) {
-    const signalKey = signal.key.toLowerCase();
-    const boolSignal = toBooleanSignal(signal.value);
-    if (
-      running === null &&
-      boolSignal !== null &&
-      (signalKey.includes("running") ||
-        signalKey.includes("active") ||
-        signalKey.includes("started") ||
-        signalKey.endsWith("up"))
-    ) {
-      running = boolSignal;
-    }
+  const daemonPositive = ["installed", "running", "active", "ready", "ok"];
+  const daemonNegative = ["not installed", "missing", "stopped", "failed", "error"];
+  const gatewayPositive = ["listening", "running", "active", "online", "ready", "up"];
+  const gatewayNegative = ["not listening", "not running", "stopped", "down", "failed", "offline"];
+  const rpcPositive = ["connected", "ready", "available", "online", "ok"];
+  const rpcNegative = ["not connected", "disconnected", "unavailable", "failed", "timeout", "error"];
 
-    if (
-      healthy === null &&
-      boolSignal !== null &&
-      (signalKey.includes("healthy") ||
-        signalKey.includes("health") ||
-        signalKey.includes("ready") ||
-        signalKey.includes("available"))
-    ) {
-      healthy = boolSignal;
-    }
+  let daemonInstalled = signalFromParsed(
+    signals,
+    ["daemon"],
+    daemonPositive,
+    daemonNegative,
+  );
+  let gatewayListening = signalFromParsed(
+    signals,
+    ["gateway", "listen", "server", "http", "port"],
+    gatewayPositive,
+    gatewayNegative,
+  );
+  let rpcConnected = signalFromParsed(signals, ["rpc"], rpcPositive, rpcNegative);
 
-    if (
-      !summary &&
-      typeof signal.value === "string" &&
-      (signalKey.includes("status") || signalKey.includes("state") || signalKey.includes("phase"))
-    ) {
-      summary = signal.value;
-    }
-  }
-
-  const mergedText = [
-    response?.message ?? "",
-    response?.stdout ?? "",
-    response?.stderr ?? "",
-    raw,
-    summary,
-  ]
+  const mergedText = [response?.message ?? "", response?.stdout ?? "", response?.stderr ?? "", raw]
     .join("\n")
     .toLowerCase();
 
-  if (running === null) {
-    if (containsToken(mergedText, STOPPED_TOKENS)) {
-      running = false;
-    } else if (containsToken(mergedText, RUNNING_TOKENS)) {
-      running = true;
+  if (daemonInstalled === null) {
+    if (containsToken(mergedText, daemonNegative)) {
+      daemonInstalled = false;
+    } else if (
+      containsToken(mergedText, ["daemon installed", "daemon running", "daemon ready"]) ||
+      (response?.success ?? false)
+    ) {
+      daemonInstalled = true;
     }
   }
 
-  if (healthy === null) {
-    if (containsToken(mergedText, ["unhealthy", "not ready"])) {
-      healthy = false;
-    } else if (containsToken(mergedText, ["healthy", "ready", "ok"])) {
-      healthy = true;
+  if (gatewayListening === null) {
+    if (containsToken(mergedText, gatewayNegative)) {
+      gatewayListening = false;
+    } else if (
+      containsToken(mergedText, ["listening", "gateway running", "gateway started", "server started"])
+    ) {
+      gatewayListening = true;
+    } else if (response?.success ?? false) {
+      gatewayListening = true;
     }
   }
 
-  const hasFieldError = signals.some((signal) => {
-    const signalKey = signal.key.toLowerCase();
-    if (!signalKey.includes("error") && !signalKey.includes("fail")) {
-      return false;
+  if (rpcConnected === null) {
+    if (containsToken(mergedText, rpcNegative)) {
+      rpcConnected = false;
+    } else if (containsToken(mergedText, ["rpc connected", "rpc ready", "rpc available"])) {
+      rpcConnected = true;
+    } else if ((response?.success ?? false) && gatewayListening === true) {
+      rpcConnected = true;
     }
-    const text = toText(signal.value).trim().toLowerCase();
-    return text !== "" && text !== "false" && text !== "0" && text !== "null";
-  });
+  }
 
-  const responseFailed = response ? !response.success : false;
-  const hasError = responseFailed || hasFieldError || containsToken(mergedText, ERROR_TOKENS);
-  const stoppedHint = running === false || containsToken(mergedText, STOPPED_TOKENS);
+  if (daemonInstalled === null && gatewayListening === true) {
+    daemonInstalled = true;
+  }
+
+  const hasError =
+    !(response?.success ?? true) ||
+    containsToken(mergedText, ["error", "failed", "exception", "panic"]);
 
   return {
-    running,
-    healthy,
-    stoppedHint,
+    daemonInstalled,
+    gatewayListening,
+    rpcConnected,
     hasError,
-    summary: summary || firstLine(response?.message ?? ""),
+    summary: firstLine(response?.message ?? ""),
   };
 }
 
-function extractDashboardUrl(response: CommandResponse | null): string {
-  if (!response) {
-    return "";
-  }
-
-  if (isRecord(response.parsed_json)) {
-    const value = response.parsed_json.url;
-    if (typeof value === "string" && value.startsWith("http")) {
-      return value;
-    }
-  }
-
-  const matched = response.stdout.match(/https?:\/\/[^\s]+/);
-  return matched ? matched[0] : "";
+function isNonEmptyString(value: unknown): boolean {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
-function classifyDashboardIssue(response: CommandResponse | null): DashboardIssue | null {
-  if (!response || response.success) {
-    return null;
+function channelSnapshotFromConfig(config: Record<string, unknown> | null): ChannelSnapshot {
+  if (!config) {
+    return { telegramConfigured: false, feishuConfigured: false };
   }
 
-  const joined = [response.message, response.stderr, response.stdout]
-    .join("\n")
-    .toLowerCase();
-
-  if (
-    joined.includes("gateway is not running") ||
-    joined.includes("gateway not ready") ||
-    joined.includes("start gateway") ||
-    joined.includes("service is not running")
-  ) {
-    return { kind: "gateway-not-ready", detail: firstLine(response.stderr || response.stdout) };
-  }
-  if (joined.includes("failed to fetch dashboard url")) {
-    return { kind: "dashboard-command-failed", detail: firstLine(response.stderr || response.stdout) };
-  }
-  if (joined.includes("url not found") || joined.includes("no url found")) {
-    return { kind: "url-missing", detail: firstLine(response.stderr || response.stdout) };
-  }
-  if (joined.includes("open dashboard url") || joined.includes("open url stderr")) {
-    return { kind: "open-url-failed", detail: firstLine(response.stderr || response.stdout) };
+  const channels = config.channels;
+  if (!isRecord(channels)) {
+    return { telegramConfigured: false, feishuConfigured: false };
   }
 
-  return { kind: "unknown", detail: firstLine(response.stderr || response.stdout || response.message) };
+  const telegram = isRecord(channels.telegram) ? channels.telegram : null;
+  const feishu = isRecord(channels.feishu) ? channels.feishu : null;
+
+  return {
+    telegramConfigured: Boolean(telegram && isNonEmptyString(telegram.botToken)),
+    feishuConfigured: Boolean(
+      feishu && isNonEmptyString(feishu.appId) && isNonEmptyString(feishu.appSecret),
+    ),
+  };
 }
 
-function isGatewayBasicReady(response: CommandResponse): boolean {
-  return (
-    response.success &&
-    (isRecord(response.parsed_json) || response.stdout.trim().length > 0)
-  );
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    window.setTimeout(resolve, ms);
-  });
-}
-
-async function waitForInstallStable(
-  refreshOverview: () => Promise<{ response: CommandResponse; installed: boolean }>,
-  refreshGateway: () => Promise<CommandResponse>,
-  refreshSettings: () => Promise<CommandResponse>,
-): Promise<{ stable: boolean; installed: boolean }> {
-  let stableSuccesses = 0;
-  let latestInstalled = false;
-
-  for (let attempt = 0; attempt < INSTALL_STABILIZE_POLL_ATTEMPTS; attempt += 1) {
-    const detect = await refreshOverview();
-    latestInstalled = detect.installed;
-    if (detect.installed) {
-      stableSuccesses += 1;
-    } else {
-      stableSuccesses = 0;
-    }
-
-    if (stableSuccesses >= INSTALL_STABLE_SUCCESS_TARGET) {
-      await refreshGateway();
-      await refreshSettings();
-      return { stable: true, installed: true };
-    }
-
-    if (attempt < INSTALL_STABILIZE_POLL_ATTEMPTS - 1) {
-      await sleep(INSTALL_STABILIZE_POLL_INTERVAL_MS);
-    }
+function providerCountFromUnknown(value: unknown): number {
+  if (!isRecord(value)) {
+    return 0;
   }
-
-  await refreshGateway();
-  if (latestInstalled) {
-    await refreshSettings();
-  }
-  return { stable: false, installed: latestInstalled };
+  return Object.keys(value).length;
 }
 
 export default function App() {
   const [locale, setLocale] = useState<Locale>(() => readStoredLocale() ?? "zh-CN");
-  const [languageConfirmed, setLanguageConfirmed] = useState<boolean>(
-    () => readStoredLocale() !== null,
-  );
+  const [languageConfirmed, setLanguageConfirmed] = useState<boolean>(() => readStoredLocale() !== null);
   const [overview, setOverview] = useState<OverviewState>({
     installed: false,
     version: "-",
     path: "-",
     configFile: "-",
   });
+  const [configExists, setConfigExists] = useState<boolean>(false);
+  const [providerCount, setProviderCount] = useState<number>(0);
+  const [channels, setChannels] = useState<ChannelSnapshot>({
+    telegramConfigured: false,
+    feishuConfigured: false,
+  });
+
+  const [providerForm, setProviderForm] = useState<ProviderFormState>(DEFAULT_PROVIDER_FORM);
+  const [telegramForm, setTelegramForm] = useState<TelegramFormState>({ botToken: "" });
+  const [feishuForm, setFeishuForm] = useState<FeishuFormState>({ appId: "", appSecret: "" });
+  const [channelTab, setChannelTab] = useState<ChannelType>("telegram");
+
   const [gatewayRaw, setGatewayRaw] = useState<string>("");
   const [gatewayParsed, setGatewayParsed] = useState<Record<string, unknown> | null>(null);
   const [gatewayResponse, setGatewayResponse] = useState<CommandResponse | null>(null);
-  const [gatewayReady, setGatewayReady] = useState<boolean>(false);
-  const [dashboardAttempt, setDashboardAttempt] = useState<DashboardAttempt | null>(null);
+
   const [settings, setSettings] = useState<CommonSettings>(DEFAULT_SETTINGS);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -850,19 +895,39 @@ export default function App() {
   const [lastUpdated, setLastUpdated] = useState<string>("-");
 
   const t = I18N[locale];
+
   const gatewayEntries = useMemo(() => Object.entries(gatewayParsed ?? {}), [gatewayParsed]);
   const gatewayInsight = useMemo(
     () => analyzeGatewayInsight(gatewayResponse, gatewayParsed, gatewayRaw),
     [gatewayResponse, gatewayParsed, gatewayRaw],
   );
-  const dashboardUrl = useMemo(
-    () => extractDashboardUrl(dashboardAttempt?.response ?? null),
-    [dashboardAttempt],
+
+  const setupChecks: SetupChecks = useMemo(
+    () => ({
+      cliInstalled: overview.installed,
+      configExists,
+      providerConfigured: providerCount > 0,
+      daemonInstalled: gatewayInsight.daemonInstalled === true,
+      gatewayListening: gatewayInsight.gatewayListening === true,
+      rpcConnected: gatewayInsight.rpcConnected === true,
+    }),
+    [overview.installed, configExists, providerCount, gatewayInsight],
   );
-  const dashboardIssue = useMemo(
-    () => classifyDashboardIssue(dashboardAttempt?.response ?? null),
-    [dashboardAttempt],
-  );
+
+  const isReady = REQUIRED_CHECK_ORDER.every((key) => setupChecks[key]);
+  const channelConfigured = channels.telegramConfigured || channels.feishuConfigured;
+
+  const appView: AppView = !languageConfirmed
+    ? "language-select"
+    : isReady
+      ? "dashboard"
+      : "onboarding";
+
+  const missingRequired = REQUIRED_CHECK_ORDER.filter((key) => !setupChecks[key]);
+  const firstMissing = missingRequired[0] ?? null;
+
+  const completedRequiredCount = REQUIRED_CHECK_ORDER.filter((key) => setupChecks[key]).length;
+  const progressPercent = Math.round((completedRequiredCount / REQUIRED_CHECK_ORDER.length) * 100);
 
   const homeStatus: HomeStatus = useMemo(() => {
     if (!overview.installed) {
@@ -871,15 +936,16 @@ export default function App() {
 
     if (
       busyAction === "install" ||
+      busyAction === "run-onboard" ||
       busyAction === "gateway-start" ||
       busyAction === "gateway-restart" ||
-      busyAction === "status" ||
+      busyAction === "refresh-status" ||
       busyAction === "boot"
     ) {
       return "starting";
     }
 
-    if (gatewayReady && !gatewayInsight.hasError) {
+    if (isReady) {
       return "console-ready";
     }
 
@@ -887,12 +953,8 @@ export default function App() {
       return "service-error";
     }
 
-    if (gatewayInsight.stoppedHint || gatewayInsight.running === false) {
-      return "installed-not-started";
-    }
-
-    return gatewayReady ? "console-ready" : "installed-not-started";
-  }, [overview.installed, busyAction, gatewayReady, gatewayInsight]);
+    return "installed-not-started";
+  }, [overview.installed, busyAction, isReady, gatewayInsight.hasError]);
 
   const homeStatusLabel =
     homeStatus === "not-installed"
@@ -917,134 +979,126 @@ export default function App() {
             : t.statusExplainReady;
 
   const nextSuggestion =
-    homeStatus === "not-installed"
+    !setupChecks.cliInstalled
       ? t.nextInstall
-      : homeStatus === "installed-not-started"
-        ? t.nextStart
-        : homeStatus === "starting"
-          ? t.nextStarting
-          : homeStatus === "service-error"
-            ? t.nextRecover
-            : dashboardIssue
-              ? t.dashboardIssueSuggestionB
-              : t.nextOpenDashboard;
+      : !setupChecks.providerConfigured
+        ? t.nextProvider
+        : !isReady
+          ? t.nextRuntime
+          : t.nextOpenDashboard;
 
-  const homeActionPlan = useMemo(() => {
-    if (homeStatus === "not-installed") {
-      return {
-        primary: "install" as HomeAction,
-        secondary: "refresh-all" as HomeAction,
-        minor: [] as HomeAction[],
-      };
-    }
-    if (homeStatus === "installed-not-started") {
-      return {
-        primary: "start" as HomeAction,
-        secondary: "refresh-status" as HomeAction,
-        minor: ["refresh-all"] as HomeAction[],
-      };
-    }
-    if (homeStatus === "starting") {
-      return {
-        primary: "refresh-status" as HomeAction,
-        secondary: "refresh-all" as HomeAction,
-        minor: [] as HomeAction[],
-      };
-    }
-    if (homeStatus === "service-error") {
-      return {
-        primary: "restart" as HomeAction,
-        secondary: "refresh-status" as HomeAction,
-        minor: ["refresh-all"] as HomeAction[],
-      };
-    }
-    return {
-      primary: "open-dashboard" as HomeAction,
-      secondary: "restart" as HomeAction,
-      minor: ["stop", "refresh-status"] as HomeAction[],
-    };
-  }, [homeStatus]);
-
-  const appView: AppView = !languageConfirmed
-    ? "language-select"
-    : overview.installed && gatewayReady
-      ? "dashboard"
-      : "onboarding";
-
-  const onboardingSteps = useMemo<OnboardingStep[]>(() => {
-    const stepDetectState: OnboardingStepState =
-      overview.installed ? "done" : busyAction === "boot" ? "active" : "pending";
-
-    const stepInstallState: OnboardingStepState =
-      overview.installed ? "done" : busyAction === "install" ? "active" : "pending";
-
-    const stepStartState: OnboardingStepState =
-      gatewayReady
-        ? "done"
-        : busyAction === "gateway-start"
-          ? "active"
-          : overview.installed
-            ? "pending"
-            : "pending";
-
-    const stepVerifyState: OnboardingStepState =
-      gatewayReady
-        ? "done"
-        : busyAction === "status" || busyAction === "boot"
-          ? "active"
-          : "pending";
-
-    return [
+  const onboardingSteps: OnboardingStep[] = useMemo(
+    () => [
       {
-        id: "detect",
-        title: t.stepDetectTitle,
-        description: t.stepDetectDescription,
-        state: stepDetectState,
+        id: "env",
+        title: t.stepEnvTitle,
+        description: t.stepEnvDescription,
+        state:
+          setupChecks.cliInstalled && setupChecks.configExists
+            ? "done"
+            : busyAction === "boot" || busyAction === "install"
+              ? "active"
+              : "pending",
       },
       {
-        id: "install",
-        title: t.stepInstallTitle,
-        description: t.stepInstallDescription,
-        state: stepInstallState,
+        id: "provider",
+        title: t.stepProviderTitle,
+        description: t.stepProviderDescription,
+        state:
+          setupChecks.providerConfigured
+            ? "done"
+            : busyAction === "save-provider"
+              ? "active"
+              : "pending",
       },
       {
-        id: "start",
-        title: t.stepStartTitle,
-        description: t.stepStartDescription,
-        state: stepStartState,
+        id: "channel",
+        title: t.stepChannelTitle,
+        description: t.stepChannelDescription,
+        state: channelConfigured
+          ? "done"
+          : busyAction === "save-channel-telegram" || busyAction === "save-channel-feishu"
+            ? "active"
+            : "pending",
       },
       {
-        id: "verify",
-        title: t.stepVerifyTitle,
-        description: t.stepVerifyDescription,
-        state: stepVerifyState,
+        id: "runtime",
+        title: t.stepRuntimeTitle,
+        description: t.stepRuntimeDescription,
+        state:
+          setupChecks.daemonInstalled &&
+          setupChecks.gatewayListening &&
+          setupChecks.rpcConnected
+            ? "done"
+            : busyAction === "run-onboard" ||
+                busyAction === "refresh-status" ||
+                busyAction === "gateway-start"
+              ? "active"
+              : "pending",
       },
-    ];
-  }, [
-    overview.installed,
-    busyAction,
-    gatewayReady,
-    t.stepDetectTitle,
-    t.stepDetectDescription,
-    t.stepInstallTitle,
-    t.stepInstallDescription,
-    t.stepStartTitle,
-    t.stepStartDescription,
-    t.stepVerifyTitle,
-    t.stepVerifyDescription,
-  ]);
+    ],
+    [
+      busyAction,
+      channelConfigured,
+      setupChecks.cliInstalled,
+      setupChecks.configExists,
+      setupChecks.providerConfigured,
+      setupChecks.daemonInstalled,
+      setupChecks.gatewayListening,
+      setupChecks.rpcConnected,
+      t.stepEnvTitle,
+      t.stepEnvDescription,
+      t.stepProviderTitle,
+      t.stepProviderDescription,
+      t.stepChannelTitle,
+      t.stepChannelDescription,
+      t.stepRuntimeTitle,
+      t.stepRuntimeDescription,
+    ],
+  );
 
-  const completedSteps = onboardingSteps.filter((step) => step.state === "done").length;
-  const progressPercent = Math.round((completedSteps / onboardingSteps.length) * 100);
+  const recommendedPrimaryAction: HomeAction =
+    firstMissing === "cliInstalled"
+      ? "install"
+      : firstMissing === "configExists"
+        ? "refresh-all"
+        : firstMissing === "providerConfigured"
+          ? "save-provider"
+          : firstMissing
+            ? "run-onboard"
+            : "open-dashboard";
 
-  const onboardingStatusText = homeStatusDescription;
+  const recommendedPrimaryText =
+    firstMissing === "cliInstalled"
+      ? t.recommendInstall
+      : firstMissing === "configExists"
+        ? t.recommendRefreshConfig
+        : firstMissing === "providerConfigured"
+          ? t.recommendProvider
+          : firstMissing
+            ? t.recommendRuntime
+            : t.recommendReady;
 
-  const isBusy = (action: string): boolean =>
-    busyAction === action || busyAction === "boot";
+  const checkLabels: Record<RequiredCheckKey, string> = {
+    cliInstalled: t.setupCheckCli,
+    configExists: t.setupCheckConfig,
+    providerConfigured: t.setupCheckProvider,
+    daemonInstalled: t.setupCheckDaemon,
+    gatewayListening: t.setupCheckGateway,
+    rpcConnected: t.setupCheckRpc,
+  };
+
+  const isBusy = (action: string): boolean => busyAction === action || busyAction === "boot";
 
   function homeActionText(action: HomeAction): string {
     if (action === "install") {
       return isBusy("install") ? t.actionInstalling : t.actionInstall;
+    }
+    if (action === "run-onboard") {
+      return isBusy("run-onboard") ? t.actionRunningOnboard : t.actionRunOnboard;
+    }
+    if (action === "save-provider") {
+      return isBusy("save-provider") ? t.actionSavingProvider : t.actionSaveProvider;
     }
     if (action === "start") {
       return isBusy("gateway-start") ? t.actionStartingGateway : t.actionStartGateway;
@@ -1056,7 +1110,7 @@ export default function App() {
       return isBusy("gateway-restart") ? t.actionRestarting : t.actionRestart;
     }
     if (action === "refresh-status") {
-      return isBusy("status") ? t.actionRefreshingStatus : t.actionRefreshStatus;
+      return isBusy("refresh-status") ? t.actionRefreshingStatus : t.actionRefreshStatus;
     }
     if (action === "refresh-all") {
       return isBusy("boot") ? t.actionRefreshingAll : t.actionRefreshAll;
@@ -1068,41 +1122,34 @@ export default function App() {
     if (Boolean(busyAction)) {
       return true;
     }
+
     if (action === "install") {
       return overview.installed;
     }
+
+    if (action === "open-dashboard") {
+      return !isReady;
+    }
+
     if (action === "refresh-all") {
       return false;
     }
+
+    if (action === "save-provider") {
+      return !overview.installed;
+    }
+
+    if (action === "run-onboard") {
+      return !overview.installed;
+    }
+
     return !overview.installed;
   }
 
-  function runHomeAction(action: HomeAction) {
-    if (action === "install") {
-      handleInstall();
-      return;
-    }
-    if (action === "start") {
-      handleGatewayAction("start");
-      return;
-    }
-    if (action === "stop") {
-      handleGatewayAction("stop");
-      return;
-    }
-    if (action === "restart") {
-      handleGatewayAction("restart");
-      return;
-    }
-    if (action === "refresh-status") {
-      handleRefreshStatus();
-      return;
-    }
-    if (action === "open-dashboard") {
-      handleOpenDashboard();
-      return;
-    }
-    void refreshAll();
+  function resetConfigAndProviders() {
+    setConfigExists(false);
+    setProviderCount(0);
+    setChannels({ telegramConfigured: false, feishuConfigured: false });
   }
 
   function persistLocale(nextLocale: Locale) {
@@ -1134,17 +1181,18 @@ export default function App() {
     setCommandHistory((current) => [`[${stamp}] ${actionName}`, ...current].slice(0, 30));
   }
 
-  async function refreshOverview(): Promise<{ response: CommandResponse; installed: boolean }> {
+  async function refreshOverview(): Promise<{ installed: boolean }> {
     const detectResponse = await detectOpenclaw();
     recordResponse(t.logDetect, detectResponse);
     const detectParsed = parseDetect(detectResponse.stdout);
     const installed = inferInstalledFromDetect(detectResponse, detectParsed);
 
-    let configFile = detectParsed.configFile;
+    let configFile = "-";
     if (installed) {
+      configFile = detectParsed.configFile;
       const configResponse = await getConfigFile();
-      recordResponse(t.logConfig, configResponse);
-      if (configResponse.success) {
+      recordResponse(t.logConfigFile, configResponse);
+      if (configResponse.success && configResponse.stdout.trim() !== "") {
         configFile = firstLine(configResponse.stdout);
       }
     }
@@ -1156,10 +1204,77 @@ export default function App() {
       configFile,
     });
 
-    return { response: detectResponse, installed };
+    return { installed };
   }
 
-  async function refreshGateway() {
+  async function refreshConfigAndProviders(installed: boolean) {
+    if (!installed) {
+      resetConfigAndProviders();
+      return;
+    }
+
+    const configResponse = await readOpenclawConfig();
+    recordResponse(t.logConfigJson, configResponse);
+
+    let parsedConfig: Record<string, unknown> | null = null;
+    if (configResponse.success && isRecord(configResponse.parsed_json)) {
+      parsedConfig = configResponse.parsed_json;
+      setConfigExists(true);
+    } else {
+      setConfigExists(false);
+    }
+
+    const channelState = channelSnapshotFromConfig(parsedConfig);
+    setChannels(channelState);
+
+    if (parsedConfig && isRecord(parsedConfig.channels)) {
+      const telegram = isRecord(parsedConfig.channels.telegram) ? parsedConfig.channels.telegram : null;
+      const feishu = isRecord(parsedConfig.channels.feishu) ? parsedConfig.channels.feishu : null;
+
+      if (telegram && isNonEmptyString(telegram.botToken)) {
+        setTelegramForm({ botToken: String(telegram.botToken) });
+      }
+      if (feishu) {
+        setFeishuForm({
+          appId: isNonEmptyString(feishu.appId) ? String(feishu.appId) : "",
+          appSecret: isNonEmptyString(feishu.appSecret) ? String(feishu.appSecret) : "",
+        });
+      }
+    }
+
+    const providersResponse = await readOpenclawProviders();
+    recordResponse(t.logProviders, providersResponse);
+
+    const count = providerCountFromUnknown(providersResponse.parsed_json);
+    setProviderCount(count);
+
+    if (providersResponse.success && isRecord(providersResponse.parsed_json) && count > 0) {
+      const [providerName, providerData] = Object.entries(providersResponse.parsed_json)[0] ?? [];
+      if (providerName && isRecord(providerData)) {
+        const models = isRecord(providerData.models) ? providerData.models : null;
+        setProviderForm((current) => ({
+          ...current,
+          providerName,
+          baseUrl: isNonEmptyString(providerData.baseUrl) ? String(providerData.baseUrl) : current.baseUrl,
+          apiKey: isNonEmptyString(providerData.apiKey) ? String(providerData.apiKey) : current.apiKey,
+          api: isNonEmptyString(providerData.api) ? String(providerData.api) : current.api,
+          defaultModel:
+            models && isNonEmptyString(models.default_model)
+              ? String(models.default_model)
+              : current.defaultModel,
+        }));
+      }
+    }
+  }
+
+  async function refreshGateway(installed: boolean) {
+    if (!installed) {
+      setGatewayResponse(null);
+      setGatewayParsed(null);
+      setGatewayRaw("");
+      return null;
+    }
+
     const response = await gatewayStatus();
     recordResponse(t.logGatewayStatus, response);
     setGatewayResponse(response);
@@ -1169,11 +1284,15 @@ export default function App() {
     } else {
       setGatewayParsed(null);
     }
-    setGatewayReady(isGatewayBasicReady(response));
     return response;
   }
 
-  async function refreshSettings() {
+  async function refreshSettings(installed: boolean) {
+    if (!installed) {
+      setSettings({ ...DEFAULT_SETTINGS });
+      return null;
+    }
+
     const response = await getCommonSettings();
     recordResponse(t.logSettings, response);
 
@@ -1205,23 +1324,16 @@ export default function App() {
   async function refreshAll() {
     setBusyAction("boot");
     setNotice({ kind: "info", text: t.noticeRefreshing });
+
     try {
       const detect = await refreshOverview();
-      const gatewayResponse = await refreshGateway();
-
-      if (detect.installed) {
-        await refreshSettings();
-      } else {
-        setSettings({ ...DEFAULT_SETTINGS });
-        setDashboardAttempt(null);
-      }
-
+      await refreshConfigAndProviders(detect.installed);
+      await refreshGateway(detect.installed);
+      await refreshSettings(detect.installed);
       markUpdated();
 
       if (!detect.installed) {
         setNotice({ kind: "info", text: t.noticeNeedInstall });
-      } else if (!gatewayResponse.success) {
-        setNotice({ kind: "info", text: t.noticeNeedGateway });
       } else {
         setNotice({ kind: "success", text: t.noticeRefreshed });
       }
@@ -1243,35 +1355,25 @@ export default function App() {
     actionKey: string,
     runningText: string,
     task: () => Promise<CommandResponse>,
-    afterSuccess?: () => Promise<Notice | void>,
+    afterSuccess?: () => Promise<void>,
   ) {
     setBusyAction(actionKey);
-    setNotice({ kind: "info", text: `${runningText}` });
+    setNotice({ kind: "info", text: runningText });
     try {
       const response = await task();
       recordResponse(runningText, response);
+
       if (!response.success) {
-        setNotice({
-          kind: "error",
-          text: response.message || t.commandFailed,
-        });
+        setNotice({ kind: "error", text: response.message || t.commandFailed });
         return;
       }
 
-      let postSuccessNotice: Notice | void = undefined;
       if (afterSuccess) {
-        postSuccessNotice = await afterSuccess();
+        await afterSuccess();
       }
 
       markUpdated();
-      if (postSuccessNotice) {
-        setNotice(postSuccessNotice);
-      } else {
-        setNotice({
-          kind: "success",
-          text: response.message || t.noticeRefreshed,
-        });
-      }
+      setNotice({ kind: "success", text: response.message || t.noticeRefreshed });
     } catch (error) {
       setNotice({ kind: "error", text: toErrorMessage(error) });
     } finally {
@@ -1279,77 +1381,135 @@ export default function App() {
     }
   }
 
-  function handleGatewayAction(action: GatewayAction) {
-    const labels: Record<GatewayAction, string> = {
-      start: t.actionStartGateway,
-      stop: t.actionStop,
-      restart: t.actionRestart,
-    };
-    void runAction(
-      `gateway-${action}`,
-      labels[action],
-      () => gatewayControl(action),
-      async () => {
-        await refreshGateway();
-        if (action === "start" || action === "restart") {
-          setDashboardAttempt(null);
-        }
-      },
-    );
-  }
-
   function handleInstall() {
     void runAction("install", t.actionInstall, installOpenclaw, async () => {
-      setNotice({ kind: "info", text: t.noticeInstallPendingRefresh });
-      const result = await waitForInstallStable(
-        refreshOverview,
-        refreshGateway,
-        refreshSettings,
-      );
-      if (!result.stable) {
-        return { kind: "info", text: t.noticeInstallDetectTimeout };
-      }
-      setDashboardAttempt(null);
-      return undefined;
+      await refreshAll();
+    });
+  }
+
+  function handleGatewayAction(action: GatewayAction) {
+    const runningText =
+      action === "start" ? t.actionStartGateway : action === "stop" ? t.actionStop : t.actionRestart;
+
+    void runAction(`gateway-${action}`, runningText, () => gatewayControl(action), async () => {
+      await refreshGateway(true);
+      await refreshConfigAndProviders(true);
+    });
+  }
+
+  function handleRunOnboard() {
+    void runAction("run-onboard", t.actionRunOnboard, runOpenclawOnboard, async () => {
+      await refreshAll();
+    });
+  }
+
+  function handleRefreshStatus() {
+    void runAction("refresh-status", t.actionRefreshStatus, gatewayStatus, async () => {
+      await refreshGateway(true);
     });
   }
 
   function handleOpenDashboard() {
-    void (async () => {
-      setBusyAction("dashboard");
-      setNotice({ kind: "info", text: t.actionOpenDashboard });
-      try {
-        const response = await openDashboard();
-        recordResponse(t.actionOpenDashboard, response);
-        const localeCode = locale === "zh-CN" ? "zh-CN" : "en-US";
-        setDashboardAttempt({
-          response,
-          at: new Date().toLocaleString(localeCode),
-        });
-
-        markUpdated();
-        if (!response.success) {
-          setNotice({
-            kind: "error",
-            text: response.message || t.commandFailed,
-          });
-          return;
-        }
-
-        setNotice({
-          kind: "success",
-          text: response.message || t.noticeRefreshed,
-        });
-      } catch (error) {
-        setNotice({ kind: "error", text: toErrorMessage(error) });
-      } finally {
-        setBusyAction(null);
-      }
-    })();
+    void runAction("dashboard", t.actionOpenDashboard, openDashboard);
   }
 
-  function handleRefreshStatus() {
-    void runAction("status", t.actionRefreshStatus, refreshGateway);
+  function validateProviderForm(): string | null {
+    if (!providerForm.providerName.trim()) {
+      return `${t.providerName} ${t.stepPending}`;
+    }
+    if (!providerForm.baseUrl.trim()) {
+      return `${t.providerBaseUrl} ${t.stepPending}`;
+    }
+    if (!providerForm.apiKey.trim()) {
+      return `${t.providerApiKey} ${t.stepPending}`;
+    }
+    if (!providerForm.api.trim()) {
+      return `${t.providerApiProtocol} ${t.stepPending}`;
+    }
+    if (!providerForm.defaultModel.trim()) {
+      return `${t.providerDefaultModel} ${t.stepPending}`;
+    }
+    return null;
+  }
+
+  function handleSaveProvider() {
+    if (!overview.installed) {
+      setNotice({ kind: "error", text: t.noticeNeedInstall });
+      return;
+    }
+
+    const validationMessage = validateProviderForm();
+    if (validationMessage) {
+      setNotice({ kind: "error", text: validationMessage });
+      return;
+    }
+
+    void runAction(
+      "save-provider",
+      t.actionSaveProvider,
+      () =>
+        writeOpenclawProvider({
+          providerName: providerForm.providerName.trim(),
+          baseUrl: providerForm.baseUrl.trim(),
+          apiKey: providerForm.apiKey.trim(),
+          api: providerForm.api.trim(),
+          defaultModel: providerForm.defaultModel.trim(),
+        }),
+      async () => {
+        await refreshConfigAndProviders(true);
+      },
+    );
+  }
+
+  function handleSaveTelegram() {
+    if (!overview.installed) {
+      setNotice({ kind: "error", text: t.noticeNeedInstall });
+      return;
+    }
+
+    if (!telegramForm.botToken.trim()) {
+      setNotice({ kind: "error", text: `${t.channelBotToken} ${t.stepPending}` });
+      return;
+    }
+
+    void runAction(
+      "save-channel-telegram",
+      t.actionSaveTelegram,
+      () =>
+        writeOpenclawChannel({
+          channel: "telegram",
+          botToken: telegramForm.botToken.trim(),
+        }),
+      async () => {
+        await refreshConfigAndProviders(true);
+      },
+    );
+  }
+
+  function handleSaveFeishu() {
+    if (!overview.installed) {
+      setNotice({ kind: "error", text: t.noticeNeedInstall });
+      return;
+    }
+
+    if (!feishuForm.appId.trim() || !feishuForm.appSecret.trim()) {
+      setNotice({ kind: "error", text: `${t.channelAppId}/${t.channelAppSecret} ${t.stepPending}` });
+      return;
+    }
+
+    void runAction(
+      "save-channel-feishu",
+      t.actionSaveFeishu,
+      () =>
+        writeOpenclawChannel({
+          channel: "feishu",
+          appId: feishuForm.appId.trim(),
+          appSecret: feishuForm.appSecret.trim(),
+        }),
+      async () => {
+        await refreshConfigAndProviders(true);
+      },
+    );
   }
 
   function handleSettingChange(path: SettingPath, value: string) {
@@ -1362,7 +1522,7 @@ export default function App() {
       `${t.settingsSaveOne} ${path}`,
       () => setCommonSetting(path, settings[path]),
       async () => {
-        await refreshSettings();
+        await refreshSettings(true);
       },
     );
   }
@@ -1370,6 +1530,7 @@ export default function App() {
   async function handleSaveAll() {
     setBusyAction("save-all");
     setNotice({ kind: "info", text: t.settingsSavingAll });
+
     try {
       const failures: string[] = [];
       for (const field of SETTING_FIELDS) {
@@ -1380,13 +1541,10 @@ export default function App() {
         }
       }
 
-      await refreshSettings();
+      await refreshSettings(true);
       markUpdated();
       if (failures.length > 0) {
-        setNotice({
-          kind: "error",
-          text: `${t.savePartialFail}: ${failures.join(", ")}`,
-        });
+        setNotice({ kind: "error", text: `${t.savePartialFail}: ${failures.join(", ")}` });
       } else {
         setNotice({ kind: "success", text: t.saveAllSuccess });
       }
@@ -1395,6 +1553,42 @@ export default function App() {
     } finally {
       setBusyAction(null);
     }
+  }
+
+  function runHomeAction(action: HomeAction) {
+    if (action === "install") {
+      handleInstall();
+      return;
+    }
+    if (action === "run-onboard") {
+      handleRunOnboard();
+      return;
+    }
+    if (action === "save-provider") {
+      handleSaveProvider();
+      return;
+    }
+    if (action === "start") {
+      handleGatewayAction("start");
+      return;
+    }
+    if (action === "stop") {
+      handleGatewayAction("stop");
+      return;
+    }
+    if (action === "restart") {
+      handleGatewayAction("restart");
+      return;
+    }
+    if (action === "refresh-status") {
+      handleRefreshStatus();
+      return;
+    }
+    if (action === "open-dashboard") {
+      handleOpenDashboard();
+      return;
+    }
+    void refreshAll();
   }
 
   function renderLanguageSelection() {
@@ -1444,6 +1638,8 @@ export default function App() {
   }
 
   function renderOnboarding() {
+    const setupConfigDisabled = Boolean(busyAction) || !overview.installed;
+
     return (
       <main className="grid-layout onboarding-layout">
         <section className="panel panel-overview">
@@ -1451,17 +1647,42 @@ export default function App() {
           <p className="lead">{t.onboardingDescription}</p>
           <div className="progress-head">
             <span>
-              {t.onboardingProgress}: {completedSteps}/{onboardingSteps.length}
+              {t.onboardingProgress}: {completedRequiredCount}/{REQUIRED_CHECK_ORDER.length}
             </span>
             <strong>{progressPercent}%</strong>
           </div>
           <div className="progress-track">
             <span style={{ width: `${progressPercent}%` }} />
           </div>
+
           <label className="field-label">{t.noticeCurrentStatus}</label>
           <p className="status-summary">
-            {homeStatusLabel}: {onboardingStatusText}
+            {homeStatusLabel}: {homeStatusDescription}
           </p>
+
+          <label className="field-label">{t.setupChecksTitle}</label>
+          <div className="status-grid setup-check-grid">
+            {REQUIRED_CHECK_ORDER.map((key) => (
+              <div key={key} className={`status-item status-${setupChecks[key] ? "done" : "todo"}`}>
+                <span>{checkLabels[key]}</span>
+                <strong>{setupChecks[key] ? t.setupCheckDone : t.setupCheckPending}</strong>
+              </div>
+            ))}
+          </div>
+
+          <label className="field-label">{t.onboardingMissing}</label>
+          {missingRequired.length === 0 ? (
+            <p className="status-summary">{t.onboardingAllDone}</p>
+          ) : (
+            <div className="missing-list">
+              {missingRequired.map((key) => (
+                <span key={key} className="state-pill state-installed-not-started">
+                  {checkLabels[key]}
+                </span>
+              ))}
+            </div>
+          )}
+
           <div className="step-list">
             {onboardingSteps.map((step) => (
               <div key={step.id} className={`step-item step-${step.state}`}>
@@ -1486,68 +1707,280 @@ export default function App() {
           <div className="home-actions onboarding-actions">
             <div className="home-action-main">
               <label className="field-label">{t.actionPrimary}</label>
-              {!overview.installed ? (
-                <button
-                  className="btn btn-primary btn-main"
-                  onClick={handleInstall}
-                  disabled={Boolean(busyAction)}
-                >
-                  {isBusy("install") ? t.actionInstalling : t.actionInstall}
-                </button>
-              ) : (
-                <button
-                  className="btn btn-primary btn-main"
-                  onClick={() => handleGatewayAction("start")}
-                  disabled={Boolean(busyAction)}
-                >
-                  {isBusy("gateway-start") ? t.actionStartingGateway : t.actionStartGateway}
-                </button>
-              )}
+              <button
+                className="btn btn-primary btn-main"
+                onClick={() => {
+                  runHomeAction(recommendedPrimaryAction);
+                }}
+                disabled={isHomeActionDisabled(recommendedPrimaryAction)}
+              >
+                {homeActionText(recommendedPrimaryAction)}
+              </button>
+              <small className="field-help">{recommendedPrimaryText}</small>
             </div>
             <div className="home-action-secondary">
               <label className="field-label">{t.actionSecondary}</label>
               <button
                 className="btn btn-secondary"
                 onClick={() => {
-                  if (!overview.installed) {
-                    void refreshAll();
-                    return;
-                  }
-                  handleRefreshStatus();
+                  runHomeAction("refresh-all");
                 }}
-                disabled={Boolean(busyAction)}
+                disabled={isHomeActionDisabled("refresh-all")}
               >
-                {!overview.installed
-                  ? isBusy("boot")
-                    ? t.actionRefreshingAll
-                    : t.actionRedetect
-                  : isBusy("status")
-                    ? t.actionRefreshingStatus
-                    : t.actionRefreshStatus}
+                {homeActionText("refresh-all")}
               </button>
             </div>
           </div>
-          <div className="kv-grid">
+
+          <div className="minor-actions">
+            <span>{t.homeQuickActionsTitle}</span>
+            <div className="minor-actions-grid">
+              <button
+                className="btn btn-ghost btn-minor"
+                onClick={() => {
+                  runHomeAction("install");
+                }}
+                disabled={isHomeActionDisabled("install")}
+              >
+                {homeActionText("install")}
+              </button>
+              <button
+                className="btn btn-ghost btn-minor"
+                onClick={() => {
+                  runHomeAction("run-onboard");
+                }}
+                disabled={isHomeActionDisabled("run-onboard")}
+              >
+                {homeActionText("run-onboard")}
+              </button>
+              <button
+                className="btn btn-ghost btn-minor"
+                onClick={() => {
+                  runHomeAction("start");
+                }}
+                disabled={isHomeActionDisabled("start")}
+              >
+                {homeActionText("start")}
+              </button>
+              <button
+                className="btn btn-ghost btn-minor"
+                onClick={() => {
+                  runHomeAction("refresh-status");
+                }}
+                disabled={isHomeActionDisabled("refresh-status")}
+              >
+                {homeActionText("refresh-status")}
+              </button>
+            </div>
+          </div>
+
+          <div className="kv-grid setup-overview-grid">
             <div className="kv-row">
               <span>{t.overviewInstallStatus}</span>
-              <strong>{overview.installed ? t.overviewInstalled : t.overviewNotInstalled}</strong>
+              <strong>{setupChecks.cliInstalled ? t.overviewInstalled : t.overviewNotInstalled}</strong>
             </div>
             <div className="kv-row">
-              <span>{t.overviewGatewayBaseStatus}</span>
-              <strong>{gatewayReady ? t.overviewGatewayReady : t.overviewGatewayNotReady}</strong>
+              <span>{t.setupCheckConfig}</span>
+              <strong>{setupChecks.configExists ? t.overviewReady : t.overviewNotReady}</strong>
             </div>
             <div className="kv-row">
-              <span>{t.overviewVersion}</span>
-              <strong>{overview.version}</strong>
+              <span>{t.providerConfiguredCount}</span>
+              <strong>{providerCount}</strong>
             </div>
             <div className="kv-row">
-              <span>{t.overviewPath}</span>
-              <strong>{overview.path}</strong>
+              <span>{t.overviewGatewayStatus}</span>
+              <strong>{setupChecks.gatewayListening ? t.overviewReady : t.overviewNotReady}</strong>
             </div>
             <div className="kv-row">
-              <span>{t.overviewConfigFile}</span>
-              <strong>{overview.configFile}</strong>
+              <span>{t.overviewRpcStatus}</span>
+              <strong>{setupChecks.rpcConnected ? t.overviewReady : t.overviewNotReady}</strong>
             </div>
+          </div>
+        </section>
+
+        <section className="panel panel-status setup-provider-card">
+          <h2>{t.setupProviderTitle}</h2>
+          <p className="home-subtitle">{t.setupProviderHint}</p>
+          <div className="form-grid">
+            <label className="input-block" htmlFor="provider-name">
+              <span className="field-label">{t.providerName}</span>
+              <input
+                id="provider-name"
+                type="text"
+                value={providerForm.providerName}
+                onChange={(event) => {
+                  setProviderForm((current) => ({ ...current, providerName: event.target.value }));
+                }}
+                disabled={setupConfigDisabled}
+              />
+            </label>
+            <label className="input-block" htmlFor="provider-base-url">
+              <span className="field-label">{t.providerBaseUrl}</span>
+              <input
+                id="provider-base-url"
+                type="text"
+                value={providerForm.baseUrl}
+                onChange={(event) => {
+                  setProviderForm((current) => ({ ...current, baseUrl: event.target.value }));
+                }}
+                disabled={setupConfigDisabled}
+              />
+            </label>
+            <label className="input-block" htmlFor="provider-api-key">
+              <span className="field-label">{t.providerApiKey}</span>
+              <input
+                id="provider-api-key"
+                type="password"
+                value={providerForm.apiKey}
+                onChange={(event) => {
+                  setProviderForm((current) => ({ ...current, apiKey: event.target.value }));
+                }}
+                disabled={setupConfigDisabled}
+              />
+            </label>
+            <label className="input-block" htmlFor="provider-api">
+              <span className="field-label">{t.providerApiProtocol}</span>
+              <input
+                id="provider-api"
+                type="text"
+                value={providerForm.api}
+                onChange={(event) => {
+                  setProviderForm((current) => ({ ...current, api: event.target.value }));
+                }}
+                disabled={setupConfigDisabled}
+              />
+            </label>
+            <label className="input-block" htmlFor="provider-default-model">
+              <span className="field-label">{t.providerDefaultModel}</span>
+              <input
+                id="provider-default-model"
+                type="text"
+                value={providerForm.defaultModel}
+                onChange={(event) => {
+                  setProviderForm((current) => ({ ...current, defaultModel: event.target.value }));
+                }}
+                disabled={setupConfigDisabled}
+              />
+            </label>
+          </div>
+          <button
+            className="btn btn-primary"
+            onClick={handleSaveProvider}
+            disabled={setupConfigDisabled}
+          >
+            {isBusy("save-provider") ? t.actionSavingProvider : t.actionSaveProvider}
+          </button>
+        </section>
+
+        <section className="panel panel-status setup-channel-card">
+          <h2>{t.setupChannelTitle}</h2>
+          <p className="home-subtitle">{t.setupChannelHint}</p>
+
+          <div className="channel-tabs" role="tablist" aria-label="channel-tabs">
+            <button
+              className={`btn btn-ghost ${channelTab === "telegram" ? "tab-active" : ""}`}
+              onClick={() => {
+                setChannelTab("telegram");
+              }}
+              disabled={setupConfigDisabled}
+            >
+              {t.channelTelegram}
+            </button>
+            <button
+              className={`btn btn-ghost ${channelTab === "feishu" ? "tab-active" : ""}`}
+              onClick={() => {
+                setChannelTab("feishu");
+              }}
+              disabled={setupConfigDisabled}
+            >
+              {t.channelFeishu}
+            </button>
+          </div>
+
+          {channelTab === "telegram" ? (
+            <div className="channel-pane">
+              <div className="channel-badge-row">
+                <span className="field-help">{t.channelTelegram}</span>
+                <span className={`state-pill ${channels.telegramConfigured ? "state-console-ready" : "state-installed-not-started"}`}>
+                  {channels.telegramConfigured ? t.channelConfigured : t.channelNotConfigured}
+                </span>
+              </div>
+              <label className="input-block" htmlFor="telegram-token">
+                <span className="field-label">{t.channelBotToken}</span>
+                <input
+                  id="telegram-token"
+                  type="password"
+                  value={telegramForm.botToken}
+                  onChange={(event) => {
+                    setTelegramForm({ botToken: event.target.value });
+                  }}
+                  disabled={setupConfigDisabled}
+                />
+              </label>
+              <button
+                className="btn btn-primary"
+                onClick={handleSaveTelegram}
+                disabled={setupConfigDisabled}
+              >
+                {isBusy("save-channel-telegram") ? t.actionSavingChannel : t.actionSaveTelegram}
+              </button>
+            </div>
+          ) : (
+            <div className="channel-pane">
+              <div className="channel-badge-row">
+                <span className="field-help">{t.channelFeishu}</span>
+                <span className={`state-pill ${channels.feishuConfigured ? "state-console-ready" : "state-installed-not-started"}`}>
+                  {channels.feishuConfigured ? t.channelConfigured : t.channelNotConfigured}
+                </span>
+              </div>
+              <label className="input-block" htmlFor="feishu-app-id">
+                <span className="field-label">{t.channelAppId}</span>
+                <input
+                  id="feishu-app-id"
+                  type="text"
+                  value={feishuForm.appId}
+                  onChange={(event) => {
+                    setFeishuForm((current) => ({ ...current, appId: event.target.value }));
+                  }}
+                  disabled={setupConfigDisabled}
+                />
+              </label>
+              <label className="input-block" htmlFor="feishu-app-secret">
+                <span className="field-label">{t.channelAppSecret}</span>
+                <input
+                  id="feishu-app-secret"
+                  type="password"
+                  value={feishuForm.appSecret}
+                  onChange={(event) => {
+                    setFeishuForm((current) => ({ ...current, appSecret: event.target.value }));
+                  }}
+                  disabled={setupConfigDisabled}
+                />
+              </label>
+              <button
+                className="btn btn-primary"
+                onClick={handleSaveFeishu}
+                disabled={setupConfigDisabled}
+              >
+                {isBusy("save-channel-feishu") ? t.actionSavingChannel : t.actionSaveFeishu}
+              </button>
+            </div>
+          )}
+
+          <div className="qq-placeholder">
+            <div className="channel-badge-row">
+              <strong>{t.channelQq}</strong>
+              <span className="state-pill state-starting">{t.setupCheckOptional}</span>
+            </div>
+            <p>{t.qqPlaceholderText}</p>
+            <a
+              href="https://q.qq.com/qqbot/openclaw/login.html"
+              target="_blank"
+              rel="noreferrer"
+              className="btn btn-secondary qq-link"
+            >
+              {t.qqPlaceholderLink}
+            </a>
           </div>
         </section>
 
@@ -1562,23 +1995,11 @@ export default function App() {
   }
 
   function renderDashboard() {
-    const dashboardIssueTitle =
-      dashboardIssue?.kind === "gateway-not-ready"
-        ? t.dashboardIssueGatewayNotReady
-        : dashboardIssue?.kind === "dashboard-command-failed"
-          ? t.dashboardIssueCommandFailed
-          : dashboardIssue?.kind === "url-missing"
-            ? t.dashboardIssueUrlMissing
-            : dashboardIssue?.kind === "open-url-failed"
-              ? t.dashboardIssueOpenFailed
-              : t.dashboardIssueUnknown;
-
-    const issueSuggestionTail =
-      dashboardIssue?.kind === "open-url-failed"
-        ? t.dashboardIssueSuggestionC
-        : dashboardIssue?.kind === "gateway-not-ready"
-          ? t.dashboardIssueSuggestionD
-          : t.dashboardIssueSuggestionB;
+    const homeActionPlan = {
+      primary: "open-dashboard" as HomeAction,
+      secondary: "refresh-status" as HomeAction,
+      minor: ["start", "restart", "stop", "refresh-all", "run-onboard"] as HomeAction[],
+    };
 
     return (
       <main className="home-layout">
@@ -1592,11 +2013,11 @@ export default function App() {
           <div className="home-core">
             <div className="home-row">
               <span>{t.homeStatusTitle}</span>
-              <strong>{overview.installed ? t.overviewInstalled : t.overviewNotInstalled}</strong>
+              <strong>{isReady ? t.overviewReady : t.overviewNotReady}</strong>
             </div>
             <div className="home-row">
               <span>{t.homeServiceTitle}</span>
-              <strong>{homeStatusLabel}</strong>
+              <strong>{gatewayInsight.summary || homeStatusLabel}</strong>
             </div>
             <div className="home-row home-row-wrap">
               <span>{t.homeNextStepTitle}</span>
@@ -1620,68 +2041,78 @@ export default function App() {
               </button>
             </div>
 
-            {homeActionPlan.secondary ? (
-              <div className="home-action-secondary">
-                <label className="field-label">{t.actionSecondary}</label>
-                <button
-                  className="btn btn-secondary"
-                  onClick={() => {
-                    runHomeAction(homeActionPlan.secondary);
-                  }}
-                  disabled={isHomeActionDisabled(homeActionPlan.secondary)}
-                >
-                  {homeActionText(homeActionPlan.secondary)}
-                </button>
-              </div>
-            ) : null}
+            <div className="home-action-secondary">
+              <label className="field-label">{t.actionSecondary}</label>
+              <button
+                className="btn btn-secondary"
+                onClick={() => {
+                  runHomeAction(homeActionPlan.secondary);
+                }}
+                disabled={isHomeActionDisabled(homeActionPlan.secondary)}
+              >
+                {homeActionText(homeActionPlan.secondary)}
+              </button>
+            </div>
           </div>
 
-          {homeActionPlan.minor.length > 0 ? (
-            <div className="minor-actions">
-              <span>{t.homeQuickActionsTitle}</span>
-              <div className="minor-actions-grid">
-                {homeActionPlan.minor.map((action) => (
-                  <button
-                    key={action}
-                    className="btn btn-ghost btn-minor"
-                    onClick={() => {
-                      runHomeAction(action);
-                    }}
-                    disabled={isHomeActionDisabled(action)}
-                  >
-                    {homeActionText(action)}
-                  </button>
-                ))}
-              </div>
+          <div className="minor-actions">
+            <span>{t.homeQuickActionsTitle}</span>
+            <div className="minor-actions-grid">
+              {homeActionPlan.minor.map((action) => (
+                <button
+                  key={action}
+                  className="btn btn-ghost btn-minor"
+                  onClick={() => {
+                    runHomeAction(action);
+                  }}
+                  disabled={isHomeActionDisabled(action)}
+                >
+                  {homeActionText(action)}
+                </button>
+              ))}
             </div>
-          ) : null}
+          </div>
         </section>
 
-        {dashboardIssue ? (
-          <section className="panel dashboard-issue">
-            <h2>{t.dashboardIssueTitle}</h2>
-            <p>{dashboardIssueTitle}</p>
-            {dashboardIssue.detail ? <p className="issue-detail">{dashboardIssue.detail}</p> : null}
-            <p>{t.dashboardIssueSuggestionA}</p>
-            <p>{issueSuggestionTail}</p>
-            {dashboardAttempt ? (
-              <p className="issue-meta">
-                {t.dashboardIssueLastAttempt}: {dashboardAttempt.at}
-              </p>
-            ) : null}
-            {dashboardUrl ? (
-              <div className="kv-row">
-                <span>{t.dashboardUrlLabel}</span>
-                <strong>{dashboardUrl}</strong>
-              </div>
-            ) : null}
-          </section>
-        ) : null}
-
-        <details className="panel fold-panel">
-          <summary>{t.homeAdvancedDiagnostics}</summary>
-          <p className="fold-hint">{t.homeAdvancedDiagnosticsHint}</p>
+        <section className="panel panel-overview">
+          <h2>{t.overviewTitle}</h2>
           <div className="kv-grid">
+            <div className="kv-row">
+              <span>{t.overviewInstallStatus}</span>
+              <strong>{setupChecks.cliInstalled ? t.overviewInstalled : t.overviewNotInstalled}</strong>
+            </div>
+            <div className="kv-row">
+              <span>{t.setupCheckConfig}</span>
+              <strong>{setupChecks.configExists ? t.overviewReady : t.overviewNotReady}</strong>
+            </div>
+            <div className="kv-row">
+              <span>{t.setupCheckProvider}</span>
+              <strong>{setupChecks.providerConfigured ? t.overviewReady : t.overviewNotReady}</strong>
+            </div>
+            <div className="kv-row">
+              <span>{t.setupCheckDaemon}</span>
+              <strong>{setupChecks.daemonInstalled ? t.overviewReady : t.overviewNotReady}</strong>
+            </div>
+            <div className="kv-row">
+              <span>{t.overviewGatewayStatus}</span>
+              <strong>{setupChecks.gatewayListening ? t.overviewReady : t.overviewNotReady}</strong>
+            </div>
+            <div className="kv-row">
+              <span>{t.overviewRpcStatus}</span>
+              <strong>{setupChecks.rpcConnected ? t.overviewReady : t.overviewNotReady}</strong>
+            </div>
+            <div className="kv-row">
+              <span>{t.providerConfiguredCount}</span>
+              <strong>{providerCount}</strong>
+            </div>
+            <div className="kv-row">
+              <span>{t.channelTelegram}</span>
+              <strong>{channels.telegramConfigured ? t.channelConfigured : t.channelNotConfigured}</strong>
+            </div>
+            <div className="kv-row">
+              <span>{t.channelFeishu}</span>
+              <strong>{channels.feishuConfigured ? t.channelConfigured : t.channelNotConfigured}</strong>
+            </div>
             <div className="kv-row">
               <span>{t.overviewVersion}</span>
               <strong>{overview.version}</strong>
@@ -1694,13 +2125,12 @@ export default function App() {
               <span>{t.overviewConfigFile}</span>
               <strong>{overview.configFile}</strong>
             </div>
-            <div className="kv-row">
-              <span>{t.homeServiceTitle}</span>
-              <strong>
-                {gatewayInsight.summary || (gatewayReady ? t.overviewGatewayReady : t.overviewGatewayNotReady)}
-              </strong>
-            </div>
           </div>
+        </section>
+
+        <details className="panel fold-panel">
+          <summary>{t.homeAdvancedDiagnostics}</summary>
+          <p className="fold-hint">{t.homeAdvancedDiagnosticsHint}</p>
 
           <label className="field-label">{t.diagnosticsStructuredStatus}</label>
           <pre className="raw">
@@ -1726,14 +2156,9 @@ export default function App() {
               <button
                 className="btn btn-secondary"
                 onClick={() => {
-                  void runAction(
-                    "reload-settings",
-                    t.settingsReload,
-                    getCommonSettings,
-                    async () => {
-                      await refreshSettings();
-                    },
-                  );
+                  void runAction("reload-settings", t.settingsReload, getCommonSettings, async () => {
+                    await refreshSettings(true);
+                  });
                 }}
                 disabled={Boolean(busyAction)}
               >

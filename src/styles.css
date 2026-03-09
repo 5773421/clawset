@@ -427,6 +427,92 @@ body {
   overflow-wrap: anywhere;
 }
 
+.setup-check-grid .status-done {
+  border-color: #b7dbc8;
+  background: #edf8f1;
+}
+
+.setup-check-grid .status-todo {
+  border-color: #dbe3dd;
+  background: #f8fbf8;
+}
+
+.missing-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.setup-overview-grid {
+  margin-top: 10px;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.input-block {
+  display: grid;
+  gap: 4px;
+}
+
+.input-block input,
+.input-block select {
+  margin-bottom: 0;
+}
+
+.setup-provider-card .btn,
+.setup-channel-card .btn {
+  width: fit-content;
+}
+
+.channel-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.tab-active {
+  border-color: #a0c5b2;
+  background: #e8f4ed;
+  color: #1f6648;
+}
+
+.channel-pane {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.channel-badge-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.qq-placeholder {
+  border: 1px dashed #c9d6cf;
+  border-radius: 12px;
+  background: #f8fbf8;
+  padding: 10px 12px;
+}
+
+.qq-placeholder p {
+  margin: 8px 0 10px;
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
+.qq-link {
+  text-decoration: none;
+}
+
 .field-label {
   display: block;
   margin-bottom: 6px;
@@ -708,6 +794,10 @@ select:focus {
   }
 
   .home-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .form-grid {
     grid-template-columns: 1fr;
   }
 }

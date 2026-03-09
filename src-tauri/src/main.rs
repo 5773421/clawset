@@ -629,6 +629,146 @@ fn default_openclaw_config_file() -> Option<String> {
     }
 }
 
+fn openclaw_config_path() -> Result<PathBuf, String> {
+    home_dir()
+        .map(|home| home.join(".openclaw").join("openclaw.json"))
+        .ok_or_else(|| "HOME directory is not available".to_string())
+}
+
+fn read_openclaw_config_value_from_path(config_path: &Path) -> Result<Value, String> {
+    if !config_path.exists() {
+        return Err(format!(
+            "config file {} does not exist",
+            config_path.to_string_lossy()
+        ));
+    }
+
+    if !config_path.is_file() {
+        return Err(format!(
+            "config path {} is not a file",
+            config_path.to_string_lossy()
+        ));
+    }
+
+    let content = std::fs::read_to_string(config_path).map_err(|err| {
+        format!(
+            "failed to read config file {}: {err}",
+            config_path.to_string_lossy()
+        )
+    })?;
+
+    if content.trim().is_empty() {
+        return Ok(Value::Object(Map::new()));
+    }
+
+    let parsed: Value = serde_json::from_str(&content).map_err(|err| {
+        format!(
+            "failed to parse config file {} as JSON: {err}",
+            config_path.to_string_lossy()
+        )
+    })?;
+
+    if !parsed.is_object() {
+        return Err(format!(
+            "config file {} root must be a JSON object",
+            config_path.to_string_lossy()
+        ));
+    }
+
+    Ok(parsed)
+}
+
+fn ensure_openclaw_config_file() -> Result<PathBuf, String> {
+    let config_path = openclaw_config_path()?;
+
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create config dir {}: {err}", parent.display()))?;
+    }
+
+    if !config_path.exists() {
+        std::fs::write(&config_path, "{}\n").map_err(|err| {
+            format!(
+                "failed to initialize config file {}: {err}",
+                config_path.display()
+            )
+        })?;
+    }
+
+    Ok(config_path)
+}
+
+fn read_openclaw_config_value() -> Result<Value, String> {
+    let config_path = openclaw_config_path()?;
+    read_openclaw_config_value_from_path(&config_path)
+}
+
+fn read_openclaw_config_value_for_write() -> Result<Value, String> {
+    let config_path = openclaw_config_path()?;
+    if config_path.exists() {
+        read_openclaw_config_value_from_path(&config_path)
+    } else {
+        Ok(Value::Object(Map::new()))
+    }
+}
+
+fn write_openclaw_config_value(config: &Value) -> Result<(), String> {
+    if !config.is_object() {
+        return Err("config root must be a JSON object".to_string());
+    }
+
+    let config_path = ensure_openclaw_config_file()?;
+    let mut serialized = serde_json::to_string_pretty(config)
+        .map_err(|err| format!("failed to serialize config JSON: {err}"))?;
+    serialized.push('\n');
+
+    std::fs::write(&config_path, serialized)
+        .map_err(|err| format!("failed to write config file {}: {err}", config_path.display()))
+}
+
+fn openclaw_cli_available(context: &OpenclawExecutionContext) -> bool {
+    let has_executable = context
+        .resolution
+        .executable_path
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let version = run_openclaw_command_with_context(context, &["--version"]);
+    let version_text = extract_version_text(&version.stdout);
+    let has_version_signal = version.exit_code == 0 || !version_text.is_empty();
+    has_executable || has_version_signal
+}
+
+fn ensure_openclaw_cli_available() -> Result<(), String> {
+    let context = resolve_openclaw_execution_context();
+    if openclaw_cli_available(&context) {
+        Ok(())
+    } else {
+        Err("OpenClaw CLI is not installed or not available".to_string())
+    }
+}
+
+fn root_object_mut(config: &mut Value) -> Result<&mut Map<String, Value>, String> {
+    config
+        .as_object_mut()
+        .ok_or_else(|| "config root must be a JSON object".to_string())
+}
+
+fn get_or_insert_object_field<'a>(
+    parent: &'a mut Map<String, Value>,
+    key: &str,
+    full_path: &str,
+) -> Result<&'a mut Map<String, Value>, String> {
+    if !parent.contains_key(key) {
+        parent.insert(key.to_string(), Value::Object(Map::new()));
+    }
+
+    match parent.get_mut(key) {
+        Some(Value::Object(object)) => Ok(object),
+        Some(_) => Err(format!("{full_path} must be a JSON object")),
+        None => Err(format!("failed to access {full_path}")),
+    }
+}
+
 fn extract_version_text(raw_stdout: &str) -> String {
     let lines = clean_non_empty_lines(raw_stdout);
     for line in lines.iter().rev() {
@@ -771,25 +911,17 @@ fn detect_openclaw() -> CommandResponse {
     let display_path = resolution.executable_path.clone().unwrap_or_default();
 
     let has_executable = !display_path.is_empty();
-    let has_install_dir = install_dir.is_some();
-    let has_config_file = !config_file_path.is_empty();
     let has_version_signal = version.exit_code == 0 || !version_text.is_empty();
 
     let mut detected_by = Vec::new();
     if has_executable {
         detected_by.push("executable_path");
     }
-    if has_install_dir {
-        detected_by.push("install_dir");
-    }
-    if has_config_file {
-        detected_by.push("config_file");
-    }
     if has_version_signal {
         detected_by.push("version");
     }
 
-    let success = has_executable || has_install_dir || has_config_file || has_version_signal;
+    let success = has_executable || has_version_signal;
     let install_dir_text = install_dir.unwrap_or_default();
 
     let mut stdout_lines = vec![
@@ -1067,6 +1199,230 @@ fn open_dashboard() -> CommandResponse {
     }
 }
 
+#[tauri::command]
+fn read_openclaw_config() -> CommandResponse {
+    match read_openclaw_config_value() {
+        Ok(config) => {
+            let stdout = serde_json::to_string_pretty(&config).unwrap_or_default();
+            CommandResponse {
+                success: true,
+                stdout,
+                stderr: String::new(),
+                exit_code: 0,
+                message: "OpenClaw config loaded".to_string(),
+                parsed_json: Some(config),
+            }
+        }
+        Err(error) => CommandResponse::failure("Failed to read OpenClaw config", error),
+    }
+}
+
+#[tauri::command]
+fn read_openclaw_providers() -> CommandResponse {
+    match read_openclaw_config_value() {
+        Ok(config) => {
+            let Some(root) = config.as_object() else {
+                return CommandResponse::failure(
+                    "Failed to read OpenClaw providers",
+                    "config root must be a JSON object",
+                );
+            };
+
+            let providers = match root.get("models").and_then(|value| value.as_object()) {
+                Some(models) => match models.get("providers") {
+                    Some(value) if value.is_object() => value.clone(),
+                    Some(_) => {
+                        return CommandResponse::failure(
+                            "Failed to read OpenClaw providers",
+                            "models.providers must be a JSON object",
+                        )
+                    }
+                    None => Value::Object(Map::new()),
+                },
+                None => Value::Object(Map::new()),
+            };
+
+            let stdout = serde_json::to_string_pretty(&providers).unwrap_or_default();
+            CommandResponse {
+                success: true,
+                stdout,
+                stderr: String::new(),
+                exit_code: 0,
+                message: "OpenClaw providers loaded".to_string(),
+                parsed_json: Some(providers),
+            }
+        }
+        Err(error) => CommandResponse::failure("Failed to read OpenClaw providers", error),
+    }
+}
+
+#[tauri::command]
+fn write_openclaw_provider(
+    provider_name: String,
+    base_url: String,
+    api_key: String,
+    api: String,
+    default_model: String,
+) -> CommandResponse {
+    if let Err(error) = ensure_openclaw_cli_available() {
+        return CommandResponse::failure("Failed to write OpenClaw provider", error);
+    }
+
+    let provider_name = provider_name.trim().to_string();
+    if provider_name.is_empty() {
+        return CommandResponse::failure(
+            "Failed to write OpenClaw provider",
+            "provider_name cannot be empty",
+        );
+    }
+
+    match read_openclaw_config_value_for_write() {
+        Ok(mut config) => {
+            let result = (|| -> Result<Value, String> {
+                let root = root_object_mut(&mut config)?;
+                let models = get_or_insert_object_field(root, "models", "models")?;
+                let providers =
+                    get_or_insert_object_field(models, "providers", "models.providers")?;
+
+                let provider_snapshot = {
+                    let provider_value = providers
+                        .entry(provider_name.clone())
+                        .or_insert_with(|| Value::Object(Map::new()));
+                    let provider_object = provider_value.as_object_mut().ok_or_else(|| {
+                        format!("models.providers.{} must be a JSON object", provider_name)
+                    })?;
+
+                    provider_object.insert("baseUrl".to_string(), Value::String(base_url));
+                    provider_object.insert("apiKey".to_string(), Value::String(api_key));
+                    provider_object.insert("api".to_string(), Value::String(api));
+
+                    let models_value = provider_object
+                        .entry("models".to_string())
+                        .or_insert_with(|| Value::Object(Map::new()));
+                    let models_object = models_value.as_object_mut().ok_or_else(|| {
+                        format!("models.providers.{}.models must be a JSON object", provider_name)
+                    })?;
+                    models_object
+                        .insert("default_model".to_string(), Value::String(default_model.clone()));
+
+                    Value::Object(provider_object.clone())
+                };
+                write_openclaw_config_value(&config)?;
+                Ok(provider_snapshot)
+            })();
+
+            match result {
+                Ok(provider) => CommandResponse {
+                    success: true,
+                    stdout: serde_json::to_string_pretty(&provider).unwrap_or_default(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                    message: format!("Provider '{}' saved", provider_name),
+                    parsed_json: Some(provider),
+                },
+                Err(error) => CommandResponse::failure("Failed to write OpenClaw provider", error),
+            }
+        }
+        Err(error) => CommandResponse::failure("Failed to write OpenClaw provider", error),
+    }
+}
+
+#[tauri::command]
+fn write_openclaw_channel(
+    channel: String,
+    bot_token: Option<String>,
+    app_id: Option<String>,
+    app_secret: Option<String>,
+) -> CommandResponse {
+    if let Err(error) = ensure_openclaw_cli_available() {
+        return CommandResponse::failure("Failed to write OpenClaw channel", error);
+    }
+
+    let channel_key = channel.trim().to_ascii_lowercase();
+
+    match read_openclaw_config_value_for_write() {
+        Ok(mut config) => {
+            let result = (|| -> Result<Value, String> {
+                let root = root_object_mut(&mut config)?;
+                let channels = get_or_insert_object_field(root, "channels", "channels")?;
+
+                match channel_key.as_str() {
+                    "telegram" => {
+                        let token = bot_token
+                            .as_ref()
+                            .map(|value| value.trim().to_string())
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| "telegram requires bot_token".to_string())?;
+
+                        let result = {
+                            let telegram_value = channels
+                                .entry("telegram".to_string())
+                                .or_insert_with(|| Value::Object(Map::new()));
+                            let telegram_obj = telegram_value.as_object_mut().ok_or_else(|| {
+                                "channels.telegram must be a JSON object".to_string()
+                            })?;
+                            telegram_obj.insert("botToken".to_string(), Value::String(token));
+                            Value::Object(telegram_obj.clone())
+                        };
+                        write_openclaw_config_value(&config)?;
+                        Ok(result)
+                    }
+                    "feishu" => {
+                        let app_id = app_id
+                            .as_ref()
+                            .map(|value| value.trim().to_string())
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| "feishu requires app_id".to_string())?;
+                        let app_secret = app_secret
+                            .as_ref()
+                            .map(|value| value.trim().to_string())
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| "feishu requires app_secret".to_string())?;
+
+                        let result = {
+                            let feishu_value = channels
+                                .entry("feishu".to_string())
+                                .or_insert_with(|| Value::Object(Map::new()));
+                            let feishu_obj = feishu_value
+                                .as_object_mut()
+                                .ok_or_else(|| "channels.feishu must be a JSON object".to_string())?;
+                            feishu_obj.insert("appId".to_string(), Value::String(app_id));
+                            feishu_obj.insert("appSecret".to_string(), Value::String(app_secret));
+                            Value::Object(feishu_obj.clone())
+                        };
+                        write_openclaw_config_value(&config)?;
+                        Ok(result)
+                    }
+                    _ => Err("channel must be one of: telegram, feishu".to_string()),
+                }
+            })();
+
+            match result {
+                Ok(channel_config) => CommandResponse {
+                    success: true,
+                    stdout: serde_json::to_string_pretty(&channel_config).unwrap_or_default(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                    message: format!("Channel '{}' saved", channel_key),
+                    parsed_json: Some(channel_config),
+                },
+                Err(error) => CommandResponse::failure("Failed to write OpenClaw channel", error),
+            }
+        }
+        Err(error) => CommandResponse::failure("Failed to write OpenClaw channel", error),
+    }
+}
+
+#[tauri::command]
+fn run_openclaw_onboard() -> CommandResponse {
+    let exec = run_openclaw_command(&["onboard", "--install-daemon", "--no-prompt"]);
+    let mut response = CommandResponse::from_exec(exec, "OpenClaw onboard command completed");
+    if !response.success {
+        response.message = "OpenClaw onboard failed".to_string();
+    }
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1261,6 +1617,53 @@ openclaw is /opt/homebrew/bin/openclaw
 
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    #[test]
+    fn reading_missing_config_has_no_side_effect() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "clawset-test-read-missing-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("create temp dir");
+
+        let config_path = base.join("openclaw.json");
+        assert!(!config_path.exists());
+
+        let result = read_openclaw_config_value_from_path(&config_path);
+        assert!(result.is_err());
+        assert!(
+            !config_path.exists(),
+            "read should not create missing config file"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn reading_empty_config_file_returns_empty_object() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "clawset-test-read-empty-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("create temp dir");
+
+        let config_path = base.join("openclaw.json");
+        std::fs::write(&config_path, "\n").expect("write empty config");
+        let value = read_openclaw_config_value_from_path(&config_path).expect("read empty config");
+        assert_eq!(value, Value::Object(Map::new()));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
 
 fn main() {
@@ -1273,7 +1676,12 @@ fn main() {
             get_config_file,
             get_common_settings,
             set_common_setting,
-            open_dashboard
+            open_dashboard,
+            read_openclaw_config,
+            read_openclaw_providers,
+            write_openclaw_provider,
+            write_openclaw_channel,
+            run_openclaw_onboard
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
