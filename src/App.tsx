@@ -1056,424 +1056,482 @@ export default function App() {
   const currentMeta = copy.steps[currentStep];
   const timeLabel = formatTimestamp(locale, lastCheckedAt, copy.neverChecked);
   const canSkipSavingAi = aiConnection.connected && !serviceForm.apiKey.trim();
+  const completedCount = steps.filter((step) => step.tone === "done").length;
+  const progressPercent = `${((STEP_ORDER.indexOf(currentStep) + 1) / STEP_ORDER.length) * 100}%`;
 
   return (
     <div className="installer-shell">
-      <div className="installer-frame">
-        <aside className="progress-pane">
-          <div className="surface hero-panel">
-            <div className="brand-row">
-              <span className="brand-name">{copy.brand}</span>
-              <span className="brand-badge">{copy.badge}</span>
-            </div>
-            <h1>{copy.progressTitle}</h1>
-            <p>{copy.progressBody}</p>
-          </div>
+      <div className="installer-backdrop" aria-hidden="true">
+        <span className="backdrop-orb backdrop-orb-primary" />
+        <span className="backdrop-orb backdrop-orb-secondary" />
+        <span className="backdrop-grid" />
+      </div>
 
-          <div className="surface progress-panel">
-            <span className="section-label">{copy.currentStepLabel}</span>
-            <div className="progress-list">
-              {steps.map((step) => (
-                <div key={step.id} className={`progress-step progress-step-${step.tone}`}>
-                  <div className="progress-index">{step.index}</div>
-                  <div className="progress-copy">
-                    <strong>{step.title}</strong>
-                    <span>{step.description}</span>
-                  </div>
-                  <StatusPill
-                    tone={step.tone as "current" | "done" | "later"}
-                    text={
-                      step.tone === "current"
-                        ? copy.states.current
-                        : step.tone === "done"
-                          ? copy.states.done
-                          : copy.states.later
-                    }
-                  />
+      <div className="installer-window">
+        <div className="window-chrome">
+          <div className="window-controls" aria-hidden="true">
+            <span />
+            <span />
+            <span />
+          </div>
+          <div className="window-title">{copy.brand}</div>
+          <div className="window-status">{currentMeta.label}</div>
+        </div>
+
+        <div className="installer-frame">
+          <aside className="progress-pane">
+            <div className="surface hero-panel">
+              <div className="brand-row">
+                <span className="brand-mark" aria-hidden="true" />
+                <div className="brand-copy">
+                  <span className="brand-name">{copy.brand}</span>
+                  <span className="brand-badge">{copy.badge}</span>
                 </div>
-              ))}
-            </div>
-          </div>
+              </div>
 
-          <div className="surface aside-panel">
-            <span className="section-label">{copy.optionalTitle}</span>
-            <p className="aside-copy">{copy.optionalIntro}</p>
-            <ul className="aside-list">
-              {copy.optionalItems.map((item) => (
-                <li key={item}>{item}</li>
-              ))}
-            </ul>
-          </div>
-        </aside>
+              <div className="hero-copy">
+                <h1>{copy.progressTitle}</h1>
+                <p>{copy.progressBody}</p>
+              </div>
 
-        <main className="stage-pane">
-          <header className="surface header-panel">
-            <div>
-              <span className="section-label">{currentMeta.label}</span>
-              <h2>{currentMeta.title}</h2>
-            </div>
-
-            <div className="header-tools">
-              <label className="locale-field">
-                <span>{copy.languageLabel}</span>
-                <select value={locale} onChange={(event) => setLocale(event.target.value as Locale)}>
-                  <option value="zh-CN">简体中文</option>
-                  <option value="en-US">English</option>
-                </select>
-              </label>
-
-              <div className="timestamp-pill">
-                <span>{copy.lastCheckedLabel}</span>
-                <strong>{timeLabel}</strong>
+              <div className="hero-meta-grid">
+                <div className="hero-meta-card">
+                  <span className="metric-label">{copy.currentStepLabel}</span>
+                  <strong>{currentMeta.title}</strong>
+                  <span>{currentMeta.label}</span>
+                </div>
+                <div className="hero-meta-card">
+                  <span className="metric-label">{copy.lastCheckedLabel}</span>
+                  <strong>{timeLabel}</strong>
+                  <span>
+                    {completedCount} / {STEP_ORDER.length}
+                  </span>
+                </div>
               </div>
             </div>
-          </header>
 
-          {notice ? <div className={`notice notice-${notice.kind}`}>{notice.text}</div> : null}
+            <div className="surface progress-panel">
+              <div className="panel-heading panel-heading-compact">
+                <div>
+                  <span className="section-label">{copy.currentStepLabel}</span>
+                  <strong>{currentMeta.title}</strong>
+                </div>
+                <span className="progress-fraction">
+                  {STEP_ORDER.indexOf(currentStep) + 1}/{STEP_ORDER.length}
+                </span>
+              </div>
 
-          <section className="surface stage-card">
-            {bootstrapping ? (
-              <StageSkeleton />
-            ) : currentStep === "welcome" ? (
-              <div className="welcome-layout">
-                <div className="welcome-copy">
-                  <span className="hero-label">{copy.welcome.eyebrow}</span>
-                  <h3>{copy.welcome.title}</h3>
-                  <p className="lead">{copy.welcome.body}</p>
+              <div className="progress-bar" aria-hidden="true">
+                <span className="progress-bar-fill" style={{ width: progressPercent }} />
+              </div>
+
+              <div className="progress-list">
+                {steps.map((step) => (
+                  <div key={step.id} className={`progress-step progress-step-${step.tone}`}>
+                    <div className="progress-index">{step.index}</div>
+                    <div className="progress-copy">
+                      <span className="progress-kicker">{step.label}</span>
+                      <strong>{step.title}</strong>
+                      <span>{step.description}</span>
+                    </div>
+                    <StatusPill
+                      tone={step.tone as "current" | "done" | "later"}
+                      text={
+                        step.tone === "current"
+                          ? copy.states.current
+                          : step.tone === "done"
+                            ? copy.states.done
+                            : copy.states.later
+                      }
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="surface aside-panel">
+              <span className="section-label">{copy.optionalTitle}</span>
+              <p className="aside-copy">{copy.optionalIntro}</p>
+              <ul className="aside-list">
+                {copy.optionalItems.map((item) => (
+                  <li key={item}>{item}</li>
+                ))}
+              </ul>
+            </div>
+          </aside>
+
+          <main className="stage-pane">
+            <header className="surface header-panel">
+              <div className="header-copy">
+                <span className="section-label">{currentMeta.label}</span>
+                <h2>{currentMeta.title}</h2>
+                <p className="header-summary">{currentMeta.description}</p>
+              </div>
+
+              <div className="header-tools">
+                <label className="locale-field">
+                  <span>{copy.languageLabel}</span>
+                  <select value={locale} onChange={(event) => setLocale(event.target.value as Locale)}>
+                    <option value="zh-CN">简体中文</option>
+                    <option value="en-US">English</option>
+                  </select>
+                </label>
+
+                <div className="timestamp-pill">
+                  <span>{copy.lastCheckedLabel}</span>
+                  <strong>{timeLabel}</strong>
+                </div>
+              </div>
+            </header>
+
+            {notice ? <div className={`notice notice-${notice.kind}`}>{notice.text}</div> : null}
+
+            <section className="surface stage-card">
+              {bootstrapping ? (
+                <StageSkeleton />
+              ) : currentStep === "welcome" ? (
+                <div className="welcome-layout">
+                  <div className="welcome-copy">
+                    <span className="hero-label">{copy.welcome.eyebrow}</span>
+                    <h3>{copy.welcome.title}</h3>
+                    <p className="lead">{copy.welcome.body}</p>
+
+                    <div className="soft-panel">
+                      <div className="panel-heading">
+                        <strong>{copy.welcome.promiseTitle}</strong>
+                        <span>{copy.progressBody}</span>
+                      </div>
+                      <ul className="feature-list">
+                        {copy.welcome.promiseItems.map((item) => (
+                          <li key={item}>{item}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
+
+                  <div className="soft-panel language-panel">
+                    <div className="panel-heading">
+                      <strong>{copy.welcome.languageTitle}</strong>
+                      <span>{copy.welcome.languageBody}</span>
+                    </div>
+
+                    <div className="language-grid">
+                      <button
+                        type="button"
+                        className={`language-choice ${locale === "zh-CN" ? "language-choice-active" : ""}`}
+                        onClick={() => setLocale("zh-CN")}
+                      >
+                        <strong>{copy.welcome.chinese}</strong>
+                        <span>{copy.welcome.chineseHint}</span>
+                      </button>
+                      <button
+                        type="button"
+                        className={`language-choice ${locale === "en-US" ? "language-choice-active" : ""}`}
+                        onClick={() => setLocale("en-US")}
+                      >
+                        <strong>{copy.welcome.english}</strong>
+                        <span>{copy.welcome.englishHint}</span>
+                      </button>
+                    </div>
+
+                    <div className="action-row action-row-single">
+                      <button type="button" className="button button-primary button-large" onClick={handleWelcomeContinue}>
+                        {copy.actions.continue}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ) : currentStep === "install" ? (
+                <>
+                  <span className="hero-label">{copy.steps.install.label}</span>
+                  <h3>{copy.install.title}</h3>
+                  <p className="lead">{copy.install.body}</p>
+
+                  <div className="split-layout">
+                    <div className="soft-panel">
+                      <div className="panel-heading">
+                        <strong>{installState.installed ? copy.install.detectedTitle : copy.install.missingTitle}</strong>
+                        <span>{installState.installed ? copy.install.detectedBody : copy.install.missingBody}</span>
+                      </div>
+                    </div>
+
+                    <div className="detail-grid">
+                      <InfoCard
+                        label={copy.install.versionLabel}
+                        value={installState.version || copy.install.emptyVersion}
+                        tone={installState.version ? "ready" : "neutral"}
+                      />
+                      <InfoCard
+                        label={copy.install.locationLabel}
+                        value={installState.installDir || copy.install.emptyLocation}
+                        tone={installState.installDir ? "ready" : "neutral"}
+                      />
+                    </div>
+                  </div>
+
+                  <TechnicalDetails title={copy.technicalDetails} stdout={installState.rawStdout} stderr={installState.rawStderr} />
+
+                  <div className="action-row">
+                    <button type="button" className="button button-secondary" onClick={handleBack}>
+                      {copy.actions.back}
+                    </button>
+                    <button
+                      type="button"
+                      className="button button-secondary"
+                      onClick={() => void syncState(false)}
+                      disabled={busyAction === "check"}
+                    >
+                      {buttonLabel(busyAction, "check", copy.actions.checkAgain, copy.actions.checking)}
+                    </button>
+                    <button
+                      type="button"
+                      className="button button-primary button-large"
+                      onClick={installState.installed ? () => setCurrentStep("model") : () => void handleInstall()}
+                      disabled={busyAction === "install"}
+                    >
+                      {installState.installed
+                        ? copy.actions.continue
+                        : buttonLabel(busyAction, "install", copy.actions.install, copy.actions.installing)}
+                    </button>
+                  </div>
+                </>
+              ) : currentStep === "model" ? (
+                <>
+                  <span className="hero-label">{copy.steps.model.label}</span>
+                  <h3>{copy.model.title}</h3>
+                  <p className="lead">{copy.model.body}</p>
+
+                  <div className="soft-panel status-panel">
+                    <div className="panel-heading">
+                      <strong>{aiConnection.connected ? copy.model.connectedTitle : copy.model.emptyTitle}</strong>
+                      <span>{aiConnection.connected ? copy.model.connectedBody : copy.model.emptyBody}</span>
+                    </div>
+                    <div className="detail-grid detail-grid-single">
+                      <InfoCard
+                        label={copy.model.commonTitle}
+                        value={aiConnection.connected ? aiConnection.serviceLabel : copy.states.waiting}
+                        tone={aiConnection.connected ? "ready" : "missing"}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="panel-heading standalone-heading">
+                    <strong>{copy.model.commonTitle}</strong>
+                    <span>{copy.model.body}</span>
+                  </div>
+
+                  <div className="service-grid">
+                    {(Object.entries(SERVICE_PRESETS) as Array<[ServicePresetId, ServicePreset]>).map(([presetId, preset]) => (
+                      <button
+                        key={presetId}
+                        type="button"
+                        className={`service-card ${selectedPreset === presetId ? "service-card-active" : ""}`}
+                        onClick={() => handlePresetSelect(presetId)}
+                      >
+                        <strong>{preset.label[locale]}</strong>
+                        <span>{preset.hint[locale]}</span>
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="soft-panel form-panel">
+                    <label className="field">
+                      <span>{copy.model.accessKeyLabel}</span>
+                      <input
+                        type="password"
+                        value={serviceForm.apiKey}
+                        placeholder="sk-..."
+                        onChange={(event) => setServiceForm((current) => ({ ...current, apiKey: event.target.value }))}
+                      />
+                      <small>{copy.model.accessKeyHint}</small>
+                    </label>
+
+                    <div className="inline-bar">
+                      <button
+                        type="button"
+                        className="button button-ghost"
+                        onClick={() => setShowAdvancedFields((current) => !current)}
+                      >
+                        {showAdvancedFields ? copy.actions.hideAdvanced : copy.actions.showAdvanced}
+                      </button>
+                      <span className="helper-copy">{copy.model.advancedHint}</span>
+                    </div>
+
+                    {showAdvancedFields ? (
+                      <div className="detail-grid detail-grid-single">
+                        <label className="field">
+                          <span>{copy.model.baseUrlLabel}</span>
+                          <input
+                            type="text"
+                            value={serviceForm.baseUrl}
+                            onChange={(event) => setServiceForm((current) => ({ ...current, baseUrl: event.target.value }))}
+                          />
+                        </label>
+                        <label className="field">
+                          <span>{copy.model.apiLabel}</span>
+                          <input
+                            type="text"
+                            value={serviceForm.api}
+                            onChange={(event) => setServiceForm((current) => ({ ...current, api: event.target.value }))}
+                          />
+                        </label>
+                        <label className="field">
+                          <span>{copy.model.modelLabel}</span>
+                          <input
+                            type="text"
+                            value={serviceForm.defaultModel}
+                            onChange={(event) => setServiceForm((current) => ({ ...current, defaultModel: event.target.value }))}
+                          />
+                        </label>
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <TechnicalDetails title={copy.technicalDetails} stdout={aiConnection.rawStdout} stderr={aiConnection.rawStderr} />
+
+                  <div className="action-row">
+                    <button type="button" className="button button-secondary" onClick={handleBack}>
+                      {copy.actions.back}
+                    </button>
+                    <button
+                      type="button"
+                      className="button button-secondary"
+                      onClick={() => void syncState(false)}
+                      disabled={busyAction === "check"}
+                    >
+                      {buttonLabel(busyAction, "check", copy.actions.checkAgain, copy.actions.checking)}
+                    </button>
+                    <button
+                      type="button"
+                      className="button button-primary button-large"
+                      onClick={canSkipSavingAi ? () => setCurrentStep("launch") : () => void handleConnectAi()}
+                      disabled={busyAction === "connect" || !installState.installed}
+                    >
+                      {canSkipSavingAi
+                        ? copy.actions.continue
+                        : buttonLabel(busyAction, "connect", copy.actions.connect, copy.actions.connecting)}
+                    </button>
+                  </div>
+                </>
+              ) : currentStep === "launch" ? (
+                <>
+                  <span className="hero-label">{copy.steps.launch.label}</span>
+                  <h3>{copy.launch.title}</h3>
+                  <p className="lead">{copy.launch.body}</p>
+
+                  <div className="detail-grid launch-grid">
+                    <InfoCard
+                      label={copy.launch.cards.service}
+                      value={launchState.serviceReady ? copy.states.ready : copy.states.waiting}
+                      tone={launchState.serviceReady ? "ready" : launchState.serviceReady === false ? "missing" : "neutral"}
+                    />
+                    <InfoCard
+                      label={copy.launch.cards.local}
+                      value={launchState.localReady ? copy.states.ready : copy.states.waiting}
+                      tone={launchState.localReady ? "ready" : launchState.localReady === false ? "missing" : "neutral"}
+                    />
+                    <InfoCard
+                      label={copy.launch.cards.app}
+                      value={launchState.appReady ? copy.states.ready : copy.states.waiting}
+                      tone={launchState.appReady ? "ready" : launchState.appReady === false ? "missing" : "neutral"}
+                    />
+                  </div>
 
                   <div className="soft-panel">
                     <div className="panel-heading">
-                      <strong>{copy.welcome.promiseTitle}</strong>
+                      <strong>{launchReady ? copy.launch.readyTitle : copy.launch.pendingTitle}</strong>
+                      <span>{launchReady ? copy.launch.readyBody : copy.launch.pendingBody}</span>
                     </div>
-                    <ul className="feature-list">
-                      {copy.welcome.promiseItems.map((item) => (
-                        <li key={item}>{item}</li>
-                      ))}
-                    </ul>
-                  </div>
-                </div>
-
-                <div className="soft-panel language-panel">
-                  <div className="panel-heading">
-                    <strong>{copy.welcome.languageTitle}</strong>
-                    <span>{copy.welcome.languageBody}</span>
+                    {launchState.summary ? <p className="helper-copy">{launchState.summary}</p> : null}
                   </div>
 
-                  <div className="language-grid">
-                    <button
-                      type="button"
-                      className={`language-choice ${locale === "zh-CN" ? "language-choice-active" : ""}`}
-                      onClick={() => setLocale("zh-CN")}
-                    >
-                      <strong>{copy.welcome.chinese}</strong>
-                      <span>{copy.welcome.chineseHint}</span>
+                  <TechnicalDetails title={copy.technicalDetails} stdout={launchState.rawStdout} stderr={launchState.rawStderr} />
+
+                  <div className="action-row">
+                    <button type="button" className="button button-secondary" onClick={handleBack}>
+                      {copy.actions.back}
                     </button>
                     <button
                       type="button"
-                      className={`language-choice ${locale === "en-US" ? "language-choice-active" : ""}`}
-                      onClick={() => setLocale("en-US")}
+                      className="button button-secondary"
+                      onClick={() => void syncState(false)}
+                      disabled={busyAction === "check"}
                     >
-                      <strong>{copy.welcome.english}</strong>
-                      <span>{copy.welcome.englishHint}</span>
+                      {buttonLabel(busyAction, "check", copy.actions.checkAgain, copy.actions.checking)}
+                    </button>
+                    <button
+                      type="button"
+                      className="button button-primary button-large"
+                      onClick={launchReady ? () => setCurrentStep("success") : () => void handleLaunch()}
+                      disabled={busyAction === "launch" || !installState.installed || !aiConnection.connected}
+                    >
+                      {launchReady
+                        ? copy.actions.continue
+                        : buttonLabel(busyAction, "launch", copy.actions.launch, copy.actions.launching)}
                     </button>
                   </div>
+                </>
+              ) : (
+                <>
+                  <span className="hero-label">{copy.steps.success.label}</span>
+                  <h3>{copy.success.title}</h3>
+                  <p className="lead">{copy.success.body}</p>
 
-                  <div className="action-row action-row-single">
-                    <button type="button" className="button button-primary button-large" onClick={handleWelcomeContinue}>
-                      {copy.actions.continue}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            ) : currentStep === "install" ? (
-              <>
-                <span className="hero-label">{copy.steps.install.label}</span>
-                <h3>{copy.install.title}</h3>
-                <p className="lead">{copy.install.body}</p>
-
-                <div className="split-layout">
-                  <div className="soft-panel">
-                    <div className="panel-heading">
-                      <strong>{installState.installed ? copy.install.detectedTitle : copy.install.missingTitle}</strong>
-                      <span>{installState.installed ? copy.install.detectedBody : copy.install.missingBody}</span>
-                    </div>
-                  </div>
-
-                  <div className="detail-grid">
+                  <div className="detail-grid launch-grid">
                     <InfoCard
-                      label={copy.install.versionLabel}
-                      value={installState.version || copy.install.emptyVersion}
-                      tone={installState.version ? "ready" : "neutral"}
+                      label={copy.success.summary.install}
+                      value={installState.installed ? copy.states.ready : copy.states.waiting}
+                      tone={installState.installed ? "ready" : "missing"}
                     />
                     <InfoCard
-                      label={copy.install.locationLabel}
-                      value={installState.installDir || copy.install.emptyLocation}
-                      tone={installState.installDir ? "ready" : "neutral"}
-                    />
-                  </div>
-                </div>
-
-                <TechnicalDetails title={copy.technicalDetails} stdout={installState.rawStdout} stderr={installState.rawStderr} />
-
-                <div className="action-row">
-                  <button type="button" className="button button-secondary" onClick={handleBack}>
-                    {copy.actions.back}
-                  </button>
-                  <button
-                    type="button"
-                    className="button button-secondary"
-                    onClick={() => void syncState(false)}
-                    disabled={busyAction === "check"}
-                  >
-                    {buttonLabel(busyAction, "check", copy.actions.checkAgain, copy.actions.checking)}
-                  </button>
-                  <button
-                    type="button"
-                    className="button button-primary button-large"
-                    onClick={installState.installed ? () => setCurrentStep("model") : () => void handleInstall()}
-                    disabled={busyAction === "install"}
-                  >
-                    {installState.installed
-                      ? copy.actions.continue
-                      : buttonLabel(busyAction, "install", copy.actions.install, copy.actions.installing)}
-                  </button>
-                </div>
-              </>
-            ) : currentStep === "model" ? (
-              <>
-                <span className="hero-label">{copy.steps.model.label}</span>
-                <h3>{copy.model.title}</h3>
-                <p className="lead">{copy.model.body}</p>
-
-                <div className="soft-panel status-panel">
-                  <div className="panel-heading">
-                    <strong>{aiConnection.connected ? copy.model.connectedTitle : copy.model.emptyTitle}</strong>
-                    <span>{aiConnection.connected ? copy.model.connectedBody : copy.model.emptyBody}</span>
-                  </div>
-                  <div className="detail-grid detail-grid-single">
-                    <InfoCard
-                      label={copy.model.commonTitle}
-                      value={aiConnection.connected ? aiConnection.serviceLabel : copy.states.waiting}
+                      label={copy.success.summary.ai}
+                      value={aiConnection.connected ? copy.states.ready : copy.states.waiting}
                       tone={aiConnection.connected ? "ready" : "missing"}
                     />
-                  </div>
-                </div>
-
-                <div className="panel-heading standalone-heading">
-                  <strong>{copy.model.commonTitle}</strong>
-                </div>
-
-                <div className="service-grid">
-                  {(Object.entries(SERVICE_PRESETS) as Array<[ServicePresetId, ServicePreset]>).map(([presetId, preset]) => (
-                    <button
-                      key={presetId}
-                      type="button"
-                      className={`service-card ${selectedPreset === presetId ? "service-card-active" : ""}`}
-                      onClick={() => handlePresetSelect(presetId)}
-                    >
-                      <strong>{preset.label[locale]}</strong>
-                      <span>{preset.hint[locale]}</span>
-                    </button>
-                  ))}
-                </div>
-
-                <div className="soft-panel form-panel">
-                  <label className="field">
-                    <span>{copy.model.accessKeyLabel}</span>
-                    <input
-                      type="password"
-                      value={serviceForm.apiKey}
-                      placeholder="sk-..."
-                      onChange={(event) => setServiceForm((current) => ({ ...current, apiKey: event.target.value }))}
+                    <InfoCard
+                      label={copy.success.summary.launch}
+                      value={launchReady ? copy.states.ready : copy.states.waiting}
+                      tone={launchReady ? "ready" : "missing"}
                     />
-                    <small>{copy.model.accessKeyHint}</small>
-                  </label>
+                  </div>
 
-                  <div className="inline-bar">
+                  <div className="soft-panel">
+                    <div className="panel-heading">
+                      <strong>{copy.success.nextTitle}</strong>
+                      <span>{copy.success.nextBody}</span>
+                    </div>
+                    <div className="detail-grid launch-grid">
+                      <InfoCard label="Telegram" value={copy.success.nextCards.telegram} tone="neutral" />
+                      <InfoCard label="Feishu" value={copy.success.nextCards.feishu} tone="neutral" />
+                      <InfoCard label="Later" value={copy.success.nextCards.advanced} tone="neutral" />
+                    </div>
+                  </div>
+
+                  <div className="action-row">
                     <button
                       type="button"
-                      className="button button-ghost"
-                      onClick={() => setShowAdvancedFields((current) => !current)}
+                      className="button button-secondary"
+                      onClick={() => void syncState(false)}
+                      disabled={busyAction === "check"}
                     >
-                      {showAdvancedFields ? copy.actions.hideAdvanced : copy.actions.showAdvanced}
+                      {buttonLabel(busyAction, "check", copy.actions.checkAgain, copy.actions.checking)}
                     </button>
-                    <span className="helper-copy">{copy.model.advancedHint}</span>
+                    <button
+                      type="button"
+                      className="button button-primary button-large"
+                      onClick={() => void handleStartUsing()}
+                      disabled={busyAction === "enter"}
+                    >
+                      {buttonLabel(busyAction, "enter", copy.actions.startUsing, copy.actions.starting)}
+                    </button>
                   </div>
+                </>
+              )}
+            </section>
 
-                  {showAdvancedFields ? (
-                    <div className="detail-grid detail-grid-single">
-                      <label className="field">
-                        <span>{copy.model.baseUrlLabel}</span>
-                        <input
-                          type="text"
-                          value={serviceForm.baseUrl}
-                          onChange={(event) => setServiceForm((current) => ({ ...current, baseUrl: event.target.value }))}
-                        />
-                      </label>
-                      <label className="field">
-                        <span>{copy.model.apiLabel}</span>
-                        <input
-                          type="text"
-                          value={serviceForm.api}
-                          onChange={(event) => setServiceForm((current) => ({ ...current, api: event.target.value }))}
-                        />
-                      </label>
-                      <label className="field">
-                        <span>{copy.model.modelLabel}</span>
-                        <input
-                          type="text"
-                          value={serviceForm.defaultModel}
-                          onChange={(event) => setServiceForm((current) => ({ ...current, defaultModel: event.target.value }))}
-                        />
-                      </label>
-                    </div>
-                  ) : null}
-                </div>
-
-                <TechnicalDetails title={copy.technicalDetails} stdout={aiConnection.rawStdout} stderr={aiConnection.rawStderr} />
-
-                <div className="action-row">
-                  <button type="button" className="button button-secondary" onClick={handleBack}>
-                    {copy.actions.back}
-                  </button>
-                  <button
-                    type="button"
-                    className="button button-secondary"
-                    onClick={() => void syncState(false)}
-                    disabled={busyAction === "check"}
-                  >
-                    {buttonLabel(busyAction, "check", copy.actions.checkAgain, copy.actions.checking)}
-                  </button>
-                  <button
-                    type="button"
-                    className="button button-primary button-large"
-                    onClick={canSkipSavingAi ? () => setCurrentStep("launch") : () => void handleConnectAi()}
-                    disabled={busyAction === "connect" || !installState.installed}
-                  >
-                    {canSkipSavingAi
-                      ? copy.actions.continue
-                      : buttonLabel(busyAction, "connect", copy.actions.connect, copy.actions.connecting)}
-                  </button>
-                </div>
-              </>
-            ) : currentStep === "launch" ? (
-              <>
-                <span className="hero-label">{copy.steps.launch.label}</span>
-                <h3>{copy.launch.title}</h3>
-                <p className="lead">{copy.launch.body}</p>
-
-                <div className="detail-grid launch-grid">
-                  <InfoCard
-                    label={copy.launch.cards.service}
-                    value={launchState.serviceReady ? copy.states.ready : copy.states.waiting}
-                    tone={launchState.serviceReady ? "ready" : launchState.serviceReady === false ? "missing" : "neutral"}
-                  />
-                  <InfoCard
-                    label={copy.launch.cards.local}
-                    value={launchState.localReady ? copy.states.ready : copy.states.waiting}
-                    tone={launchState.localReady ? "ready" : launchState.localReady === false ? "missing" : "neutral"}
-                  />
-                  <InfoCard
-                    label={copy.launch.cards.app}
-                    value={launchState.appReady ? copy.states.ready : copy.states.waiting}
-                    tone={launchState.appReady ? "ready" : launchState.appReady === false ? "missing" : "neutral"}
-                  />
-                </div>
-
-                <div className="soft-panel">
-                  <div className="panel-heading">
-                    <strong>{launchReady ? copy.launch.readyTitle : copy.launch.pendingTitle}</strong>
-                    <span>{launchReady ? copy.launch.readyBody : copy.launch.pendingBody}</span>
-                  </div>
-                  {launchState.summary ? <p className="helper-copy">{launchState.summary}</p> : null}
-                </div>
-
-                <TechnicalDetails title={copy.technicalDetails} stdout={launchState.rawStdout} stderr={launchState.rawStderr} />
-
-                <div className="action-row">
-                  <button type="button" className="button button-secondary" onClick={handleBack}>
-                    {copy.actions.back}
-                  </button>
-                  <button
-                    type="button"
-                    className="button button-secondary"
-                    onClick={() => void syncState(false)}
-                    disabled={busyAction === "check"}
-                  >
-                    {buttonLabel(busyAction, "check", copy.actions.checkAgain, copy.actions.checking)}
-                  </button>
-                  <button
-                    type="button"
-                    className="button button-primary button-large"
-                    onClick={launchReady ? () => setCurrentStep("success") : () => void handleLaunch()}
-                    disabled={busyAction === "launch" || !installState.installed || !aiConnection.connected}
-                  >
-                    {launchReady
-                      ? copy.actions.continue
-                      : buttonLabel(busyAction, "launch", copy.actions.launch, copy.actions.launching)}
-                  </button>
-                </div>
-              </>
-            ) : (
-              <>
-                <span className="hero-label">{copy.steps.success.label}</span>
-                <h3>{copy.success.title}</h3>
-                <p className="lead">{copy.success.body}</p>
-
-                <div className="detail-grid launch-grid">
-                  <InfoCard
-                    label={copy.success.summary.install}
-                    value={installState.installed ? copy.states.ready : copy.states.waiting}
-                    tone={installState.installed ? "ready" : "missing"}
-                  />
-                  <InfoCard
-                    label={copy.success.summary.ai}
-                    value={aiConnection.connected ? copy.states.ready : copy.states.waiting}
-                    tone={aiConnection.connected ? "ready" : "missing"}
-                  />
-                  <InfoCard
-                    label={copy.success.summary.launch}
-                    value={launchReady ? copy.states.ready : copy.states.waiting}
-                    tone={launchReady ? "ready" : "missing"}
-                  />
-                </div>
-
-                <div className="soft-panel">
-                  <div className="panel-heading">
-                    <strong>{copy.success.nextTitle}</strong>
-                    <span>{copy.success.nextBody}</span>
-                  </div>
-                  <div className="detail-grid launch-grid">
-                    <InfoCard label="Telegram" value={copy.success.nextCards.telegram} tone="neutral" />
-                    <InfoCard label="Feishu" value={copy.success.nextCards.feishu} tone="neutral" />
-                    <InfoCard label="Later" value={copy.success.nextCards.advanced} tone="neutral" />
-                  </div>
-                </div>
-
-                <div className="action-row">
-                  <button
-                    type="button"
-                    className="button button-secondary"
-                    onClick={() => void syncState(false)}
-                    disabled={busyAction === "check"}
-                  >
-                    {buttonLabel(busyAction, "check", copy.actions.checkAgain, copy.actions.checking)}
-                  </button>
-                  <button
-                    type="button"
-                    className="button button-primary button-large"
-                    onClick={() => void handleStartUsing()}
-                    disabled={busyAction === "enter"}
-                  >
-                    {buttonLabel(busyAction, "enter", copy.actions.startUsing, copy.actions.starting)}
-                  </button>
-                </div>
-              </>
-            )}
-          </section>
-
-          <p className="footer-copy">{copy.previewHint}</p>
-        </main>
+            <p className="footer-copy">{copy.previewHint}</p>
+          </main>
+        </div>
       </div>
     </div>
   );
