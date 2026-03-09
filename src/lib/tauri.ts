@@ -1,9 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   CommandResponse,
-  GatewayAction,
-  SettingPath,
-  WriteOpenclawChannelPayload,
   WriteOpenclawProviderPayload,
 } from "../types";
 
@@ -48,32 +45,12 @@ export function installOpenclaw() {
   return call("install_openclaw");
 }
 
-export function gatewayControl(action: GatewayAction) {
-  return call("gateway_control", { action });
-}
-
 export function gatewayStatus() {
   return call("gateway_status");
 }
 
-export function getConfigFile() {
-  return call("get_config_file");
-}
-
-export function getCommonSettings() {
-  return call("get_common_settings");
-}
-
-export function setCommonSetting(path: SettingPath, value: string) {
-  return call("set_common_setting", { path, value });
-}
-
 export function openDashboard() {
   return call("open_dashboard");
-}
-
-export function readOpenclawConfig() {
-  return call("read_openclaw_config");
 }
 
 export function readOpenclawProviders() {
@@ -87,15 +64,6 @@ export function writeOpenclawProvider(payload: WriteOpenclawProviderPayload) {
     apiKey: payload.apiKey,
     api: payload.api,
     defaultModel: payload.defaultModel,
-  });
-}
-
-export function writeOpenclawChannel(payload: WriteOpenclawChannelPayload) {
-  return call("write_openclaw_channel", {
-    channel: payload.channel,
-    botToken: payload.botToken,
-    appId: payload.appId,
-    appSecret: payload.appSecret,
   });
 }
 

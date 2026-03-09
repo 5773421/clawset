@@ -8,15 +8,6 @@ use std::process::Command;
 
 const OPENCLAW_PROGRAM: &str = "openclaw";
 
-const COMMON_SETTING_PATHS: [&str; 6] = [
-    "update.channel",
-    "update.checkOnStart",
-    "acp.enabled",
-    "acp.defaultAgent",
-    "agents.defaults.thinkingDefault",
-    "agents.defaults.heartbeat.every",
-];
-
 #[derive(Debug, Clone)]
 struct ExecOutput {
     stdout: String,
@@ -436,10 +427,6 @@ fn run_openclaw_command(args: &[&str]) -> ExecOutput {
     run_openclaw_command_with_context(&context, args)
 }
 
-fn is_allowed_setting(path: &str) -> bool {
-    COMMON_SETTING_PATHS.contains(&path)
-}
-
 fn strip_ansi_sequences(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut output = Vec::with_capacity(bytes.len());
@@ -828,33 +815,6 @@ fn line_seems_banner_noise(line: &str) -> bool {
     line.chars().all(|ch| !ch.is_ascii_alphanumeric())
 }
 
-fn extract_config_get_value(path: &str, raw_stdout: &str) -> String {
-    let lines = clean_non_empty_lines(raw_stdout);
-    for line in lines.iter().rev() {
-        if let Some((left, right)) = line.split_once('=') {
-            if left.trim() == path {
-                return right.trim().to_string();
-            }
-        }
-        if let Some((left, right)) = line.split_once(':') {
-            if left.trim() == path {
-                return right.trim().to_string();
-            }
-        }
-    }
-
-    for line in lines.iter().rev() {
-        if !line_seems_banner_noise(line) {
-            return line.trim().to_string();
-        }
-    }
-
-    lines
-        .last()
-        .cloned()
-        .unwrap_or_else(|| clean_cli_text(raw_stdout).trim().to_string())
-}
-
 fn extract_url(text: &str) -> Option<String> {
     text.split_whitespace().find_map(|item| {
         let cleaned = item.trim_matches(|c: char| c == '"' || c == '\'' || c == ',' || c == ';');
@@ -1037,25 +997,6 @@ fn install_openclaw() -> CommandResponse {
 }
 
 #[tauri::command]
-fn gateway_control(action: String) -> CommandResponse {
-    let action = action.to_lowercase();
-    if action != "start" && action != "stop" && action != "restart" {
-        return CommandResponse::failure(
-            "Invalid action; use start|stop|restart",
-            format!("unsupported action: {action}"),
-        );
-    }
-
-    let exec = run_openclaw_command(&["gateway", action.as_str(), "--json"]);
-    let mut response =
-        CommandResponse::from_exec(exec, format!("Gateway {} command completed", action));
-    if !response.success {
-        response.message = format!("Gateway {} failed", action);
-    }
-    response
-}
-
-#[tauri::command]
 fn gateway_status() -> CommandResponse {
     let exec = run_openclaw_command(&["gateway", "status", "--json"]);
     let parsed_json = serde_json::from_str::<Value>(&exec.stdout).ok();
@@ -1064,83 +1005,6 @@ fn gateway_status() -> CommandResponse {
     response.parsed_json = parsed_json;
     if response.success && response.parsed_json.is_none() {
         response.message = "Gateway status fetched but stdout is not valid JSON".to_string();
-    }
-    response
-}
-
-#[tauri::command]
-fn get_config_file() -> CommandResponse {
-    let exec = run_openclaw_command(&["config", "file"]);
-    let mut response = CommandResponse::from_exec(exec, "Config file path fetched");
-    if response.success {
-        response.stdout = extract_config_file_path(&response.stdout);
-    } else {
-        response.stdout = clean_cli_text(&response.stdout).trim().to_string();
-        response.stderr = clean_cli_text(&response.stderr).trim().to_string();
-    }
-    if !response.success {
-        response.message = "Failed to fetch config file path".to_string();
-    }
-    response
-}
-
-#[tauri::command]
-fn get_common_settings() -> CommandResponse {
-    let context = resolve_openclaw_execution_context();
-    let mut parsed_settings = Map::new();
-    let mut stdout_lines = Vec::new();
-    let mut stderr_lines = Vec::new();
-    let mut exit_code = 0;
-    let mut success = true;
-
-    for path in COMMON_SETTING_PATHS {
-        let exec = run_openclaw_command_with_context(&context, &["config", "get", path]);
-        if exec.exit_code == 0 {
-            let value = extract_config_get_value(path, &exec.stdout);
-            parsed_settings.insert(path.to_string(), Value::String(value.clone()));
-            stdout_lines.push(format!("{path}={value}"));
-        } else {
-            success = false;
-            if exit_code == 0 {
-                exit_code = exec.exit_code;
-            }
-            parsed_settings.insert(path.to_string(), Value::Null);
-            stdout_lines.push(format!("{path}="));
-            if exec.stderr.is_empty() {
-                stderr_lines.push(format!("{path}: unknown error"));
-            } else {
-                stderr_lines.push(format!("{path}: {}", exec.stderr));
-            }
-        }
-    }
-
-    CommandResponse {
-        success,
-        stdout: stdout_lines.join("\n"),
-        stderr: stderr_lines.join("\n"),
-        exit_code: if success { 0 } else { exit_code },
-        message: if success {
-            "Common settings loaded".to_string()
-        } else {
-            "Some settings failed to load".to_string()
-        },
-        parsed_json: Some(Value::Object(parsed_settings)),
-    }
-}
-
-#[tauri::command]
-fn set_common_setting(path: String, value: String) -> CommandResponse {
-    if !is_allowed_setting(&path) {
-        return CommandResponse::failure(
-            "Unsupported config path",
-            format!("path is not allowed: {path}"),
-        );
-    }
-
-    let exec = run_openclaw_command(&["config", "set", path.as_str(), value.as_str()]);
-    let mut response = CommandResponse::from_exec(exec, format!("Updated setting {path}"));
-    if !response.success {
-        response.message = format!("Failed to update {path}");
     }
     response
 }
@@ -1196,24 +1060,6 @@ fn open_dashboard() -> CommandResponse {
             "Failed to open dashboard URL".to_string()
         },
         parsed_json: Some(serde_json::json!({ "url": url })),
-    }
-}
-
-#[tauri::command]
-fn read_openclaw_config() -> CommandResponse {
-    match read_openclaw_config_value() {
-        Ok(config) => {
-            let stdout = serde_json::to_string_pretty(&config).unwrap_or_default();
-            CommandResponse {
-                success: true,
-                stdout,
-                stderr: String::new(),
-                exit_code: 0,
-                message: "OpenClaw config loaded".to_string(),
-                parsed_json: Some(config),
-            }
-        }
-        Err(error) => CommandResponse::failure("Failed to read OpenClaw config", error),
     }
 }
 
@@ -1328,92 +1174,6 @@ fn write_openclaw_provider(
 }
 
 #[tauri::command]
-fn write_openclaw_channel(
-    channel: String,
-    bot_token: Option<String>,
-    app_id: Option<String>,
-    app_secret: Option<String>,
-) -> CommandResponse {
-    if let Err(error) = ensure_openclaw_cli_available() {
-        return CommandResponse::failure("Failed to write OpenClaw channel", error);
-    }
-
-    let channel_key = channel.trim().to_ascii_lowercase();
-
-    match read_openclaw_config_value_for_write() {
-        Ok(mut config) => {
-            let result = (|| -> Result<Value, String> {
-                let root = root_object_mut(&mut config)?;
-                let channels = get_or_insert_object_field(root, "channels", "channels")?;
-
-                match channel_key.as_str() {
-                    "telegram" => {
-                        let token = bot_token
-                            .as_ref()
-                            .map(|value| value.trim().to_string())
-                            .filter(|value| !value.is_empty())
-                            .ok_or_else(|| "telegram requires bot_token".to_string())?;
-
-                        let result = {
-                            let telegram_value = channels
-                                .entry("telegram".to_string())
-                                .or_insert_with(|| Value::Object(Map::new()));
-                            let telegram_obj = telegram_value.as_object_mut().ok_or_else(|| {
-                                "channels.telegram must be a JSON object".to_string()
-                            })?;
-                            telegram_obj.insert("botToken".to_string(), Value::String(token));
-                            Value::Object(telegram_obj.clone())
-                        };
-                        write_openclaw_config_value(&config)?;
-                        Ok(result)
-                    }
-                    "feishu" => {
-                        let app_id = app_id
-                            .as_ref()
-                            .map(|value| value.trim().to_string())
-                            .filter(|value| !value.is_empty())
-                            .ok_or_else(|| "feishu requires app_id".to_string())?;
-                        let app_secret = app_secret
-                            .as_ref()
-                            .map(|value| value.trim().to_string())
-                            .filter(|value| !value.is_empty())
-                            .ok_or_else(|| "feishu requires app_secret".to_string())?;
-
-                        let result = {
-                            let feishu_value = channels
-                                .entry("feishu".to_string())
-                                .or_insert_with(|| Value::Object(Map::new()));
-                            let feishu_obj = feishu_value
-                                .as_object_mut()
-                                .ok_or_else(|| "channels.feishu must be a JSON object".to_string())?;
-                            feishu_obj.insert("appId".to_string(), Value::String(app_id));
-                            feishu_obj.insert("appSecret".to_string(), Value::String(app_secret));
-                            Value::Object(feishu_obj.clone())
-                        };
-                        write_openclaw_config_value(&config)?;
-                        Ok(result)
-                    }
-                    _ => Err("channel must be one of: telegram, feishu".to_string()),
-                }
-            })();
-
-            match result {
-                Ok(channel_config) => CommandResponse {
-                    success: true,
-                    stdout: serde_json::to_string_pretty(&channel_config).unwrap_or_default(),
-                    stderr: String::new(),
-                    exit_code: 0,
-                    message: format!("Channel '{}' saved", channel_key),
-                    parsed_json: Some(channel_config),
-                },
-                Err(error) => CommandResponse::failure("Failed to write OpenClaw channel", error),
-            }
-        }
-        Err(error) => CommandResponse::failure("Failed to write OpenClaw channel", error),
-    }
-}
-
-#[tauri::command]
 fn run_openclaw_onboard() -> CommandResponse {
     let exec = run_openclaw_command(&["onboard", "--install-daemon", "--no-prompt"]);
     let mut response = CommandResponse::from_exec(exec, "OpenClaw onboard command completed");
@@ -1441,25 +1201,6 @@ Welcome to OpenClaw
 Config file: ~/.openclaw/openclaw.json";
 
         assert_eq!(extract_config_file_path(raw), "~/.openclaw/openclaw.json");
-    }
-
-    #[test]
-    fn extracts_config_get_value_from_key_value_line() {
-        let raw = "\
-\u{1b}[36mOpenClaw CLI\u{1b}[0m
-update.channel = stable";
-
-        assert_eq!(extract_config_get_value("update.channel", raw), "stable");
-    }
-
-    #[test]
-    fn extracts_config_get_value_from_last_non_banner_line() {
-        let raw = "\
-\u{1b}[36mOpenClaw CLI\u{1b}[0m
-Documentation: https://openclaw.ai/docs
-beta";
-
-        assert_eq!(extract_config_get_value("update.channel", raw), "beta");
     }
 
     #[test]
@@ -1671,16 +1412,10 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             detect_openclaw,
             install_openclaw,
-            gateway_control,
             gateway_status,
-            get_config_file,
-            get_common_settings,
-            set_common_setting,
             open_dashboard,
-            read_openclaw_config,
             read_openclaw_providers,
             write_openclaw_provider,
-            write_openclaw_channel,
             run_openclaw_onboard
         ])
         .run(tauri::generate_context!())
