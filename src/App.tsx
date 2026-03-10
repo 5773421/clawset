@@ -831,6 +831,47 @@ function compatibilityModeIdFromValue(value: string): CompatibilityModeId {
   return normalized ?? (value.trim() ? "custom" : "openai-completions");
 }
 
+function defaultModelFromProviderModels(models: unknown): string {
+  if (isRecord(models)) {
+    return toText(models.default_model).trim();
+  }
+
+  if (!Array.isArray(models)) {
+    return "";
+  }
+
+  for (const item of models) {
+    if (typeof item === "string") {
+      const modelId = item.trim();
+      if (modelId) {
+        return modelId;
+      }
+      continue;
+    }
+
+    if (!isRecord(item)) {
+      continue;
+    }
+
+    const modelId = toText(item.id).trim();
+    if (modelId) {
+      return modelId;
+    }
+
+    const legacyDefault = toText(item.default_model).trim();
+    if (legacyDefault) {
+      return legacyDefault;
+    }
+
+    const modelName = toText(item.name).trim();
+    if (modelName) {
+      return modelName;
+    }
+  }
+
+  return "";
+}
+
 function parseAiConnectionResponse(response: CommandResponse): AiConnectionSnapshot {
   const parsed = isRecord(response.parsed_json) ? response.parsed_json : null;
   const providers = parsed ? Object.entries(parsed) : [];
@@ -841,8 +882,7 @@ function parseAiConnectionResponse(response: CommandResponse): AiConnectionSnaps
 
     const apiKey = toText(value.apiKey).trim();
     const baseUrl = toText(value.baseUrl).trim();
-    const models = isRecord(value.models) ? value.models : null;
-    const defaultModel = models ? toText(models.default_model).trim() : "";
+    const defaultModel = defaultModelFromProviderModels(value.models);
     return Boolean(apiKey || baseUrl || defaultModel);
   });
 
@@ -856,11 +896,10 @@ function parseAiConnectionResponse(response: CommandResponse): AiConnectionSnaps
     };
   }
 
-  const models = isRecord(providerValue.models) ? providerValue.models : null;
   const providerName = toText(providerValue.providerName).trim() || providerKey;
   const baseUrl = toText(providerValue.baseUrl).trim();
   const api = toText(providerValue.api).trim();
-  const defaultModel = models ? toText(models.default_model).trim() : "";
+  const defaultModel = defaultModelFromProviderModels(providerValue.models);
 
   return {
     checked: true,

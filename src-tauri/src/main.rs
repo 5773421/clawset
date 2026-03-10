@@ -797,6 +797,107 @@ fn normalize_openclaw_provider_api_value(api: &str) -> String {
     }
 }
 
+fn openclaw_provider_models_value(default_model: &str, api: Option<&str>) -> Value {
+    let model_id = default_model.trim();
+    if model_id.is_empty() {
+        return Value::Array(Vec::new());
+    }
+
+    let mut model = Map::new();
+    model.insert("id".to_string(), Value::String(model_id.to_string()));
+    model.insert("name".to_string(), Value::String(model_id.to_string()));
+
+    if let Some(api_value) = api.map(str::trim).filter(|value| !value.is_empty()) {
+        model.insert("api".to_string(), Value::String(api_value.to_string()));
+    }
+
+    Value::Array(vec![Value::Object(model)])
+}
+
+fn migrate_openclaw_provider_models_values(config: &mut Value) -> Result<bool, String> {
+    let Some(root) = config.as_object_mut() else {
+        return Err("config root must be a JSON object".to_string());
+    };
+    let Some(models_value) = root.get_mut("models") else {
+        return Ok(false);
+    };
+    let Some(models) = models_value.as_object_mut() else {
+        return Err("models must be a JSON object".to_string());
+    };
+    let Some(providers_value) = models.get_mut("providers") else {
+        return Ok(false);
+    };
+    let Some(providers) = providers_value.as_object_mut() else {
+        return Err("models.providers must be a JSON object".to_string());
+    };
+
+    let mut changed = false;
+    for provider in providers.values_mut() {
+        let Some(provider_object) = provider.as_object_mut() else {
+            continue;
+        };
+
+        let provider_api = provider_object
+            .get("api")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
+        let Some(models_value) = provider_object.get_mut("models") else {
+            continue;
+        };
+
+        let replacement = match models_value {
+            Value::Array(_) => None,
+            Value::Object(models_object) => Some(
+                models_object
+                    .get("default_model")
+                    .and_then(Value::as_str)
+                    .map(|default_model| {
+                        openclaw_provider_models_value(default_model, provider_api.as_deref())
+                    })
+                    .unwrap_or_else(|| Value::Array(vec![Value::Object(models_object.clone())])),
+            ),
+            Value::String(default_model) => Some(openclaw_provider_models_value(
+                default_model,
+                provider_api.as_deref(),
+            )),
+            _ => None,
+        };
+
+        if let Some(next_models_value) = replacement {
+            *models_value = next_models_value;
+            changed = true;
+        }
+    }
+
+    Ok(changed)
+}
+
+fn migrate_openclaw_provider_compatibility_values(config: &mut Value) -> Result<bool, String> {
+    let api_changed = migrate_openclaw_provider_api_values(config)?;
+    let models_changed = migrate_openclaw_provider_models_values(config)?;
+    Ok(api_changed || models_changed)
+}
+
+fn migrate_openclaw_config_file_for_cli() -> Result<bool, String> {
+    let config_path = match openclaw_config_path() {
+        Ok(path) => path,
+        Err(_) => return Ok(false),
+    };
+
+    if !config_path.exists() {
+        return Ok(false);
+    }
+
+    let mut config = read_openclaw_config_value_from_path(&config_path)?;
+    let changed = migrate_openclaw_provider_compatibility_values(&mut config)?;
+    if changed {
+        write_openclaw_config_value(&config)?;
+    }
+
+    Ok(changed)
+}
+
 fn migrate_openclaw_provider_api_values(config: &mut Value) -> Result<bool, String> {
     let Some(root) = config.as_object_mut() else {
         return Err("config root must be a JSON object".to_string());
@@ -1078,6 +1179,10 @@ fn install_openclaw() -> CommandResponse {
 
 #[tauri::command]
 fn gateway_status() -> CommandResponse {
+    if let Err(error) = migrate_openclaw_config_file_for_cli() {
+        return CommandResponse::failure("Failed to fetch gateway status", error);
+    }
+
     let exec = run_openclaw_command(&["gateway", "status", "--json"]);
     let parsed_json = serde_json::from_str::<Value>(&exec.stdout).ok();
 
@@ -1147,7 +1252,7 @@ fn open_dashboard() -> CommandResponse {
 fn read_openclaw_providers() -> CommandResponse {
     match read_openclaw_config_value() {
         Ok(mut config) => {
-            let migration_warning = match migrate_openclaw_provider_api_values(&mut config) {
+            let migration_warning = match migrate_openclaw_provider_compatibility_values(&mut config) {
                 Ok(true) => write_openclaw_config_value(&config)
                     .err()
                     .map(|error| format!("Failed to persist compatibility migration: {error}")),
@@ -1231,16 +1336,12 @@ fn write_openclaw_provider(
 
                     provider_object.insert("baseUrl".to_string(), Value::String(base_url));
                     provider_object.insert("apiKey".to_string(), Value::String(api_key));
-                    provider_object.insert("api".to_string(), Value::String(api));
+                    provider_object.insert("api".to_string(), Value::String(api.clone()));
 
-                    let models_value = provider_object
-                        .entry("models".to_string())
-                        .or_insert_with(|| Value::Object(Map::new()));
-                    let models_object = models_value.as_object_mut().ok_or_else(|| {
-                        format!("models.providers.{}.models must be a JSON object", provider_name)
-                    })?;
-                    models_object
-                        .insert("default_model".to_string(), Value::String(default_model.clone()));
+                    provider_object.insert(
+                        "models".to_string(),
+                        openclaw_provider_models_value(&default_model, Some(&api)),
+                    );
 
                     Value::Object(provider_object.clone())
                 };
@@ -1266,6 +1367,10 @@ fn write_openclaw_provider(
 
 #[tauri::command]
 fn run_openclaw_onboard() -> CommandResponse {
+    if let Err(error) = migrate_openclaw_config_file_for_cli() {
+        return CommandResponse::failure("OpenClaw onboard failed", error);
+    }
+
     let exec = run_openclaw_command(&OPENCLAW_ONBOARD_ARGS);
     let parsed_json = serde_json::from_str::<Value>(&exec.stdout).ok();
 
@@ -1588,6 +1693,69 @@ openclaw is /opt/homebrew/bin/openclaw
         assert_eq!(
             config["models"]["providers"]["already_valid"]["api"],
             Value::String("ollama".to_string())
+        );
+    }
+
+    #[test]
+    fn migrates_legacy_provider_models_object_to_array() {
+        let mut config = serde_json::json!({
+            "models": {
+                "providers": {
+                    "custom": {
+                        "api": "openai-completions",
+                        "models": {
+                            "default_model": "gpt-4o-mini"
+                        }
+                    }
+                }
+            }
+        });
+
+        let changed = migrate_openclaw_provider_models_values(&mut config).expect("migrate config");
+        assert!(changed);
+        assert_eq!(
+            config["models"]["providers"]["custom"]["models"],
+            serde_json::json!([
+                {
+                    "id": "gpt-4o-mini",
+                    "name": "gpt-4o-mini",
+                    "api": "openai-completions"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn compatibility_migration_updates_api_and_models_together() {
+        let mut config = serde_json::json!({
+            "models": {
+                "providers": {
+                    "custom": {
+                        "api": "openai",
+                        "models": {
+                            "default_model": "gpt-4o-mini"
+                        }
+                    }
+                }
+            }
+        });
+
+        let changed =
+            migrate_openclaw_provider_compatibility_values(&mut config).expect("migrate config");
+        assert!(changed);
+        assert_eq!(
+            config["models"]["providers"]["custom"]["api"],
+            Value::String("openai-completions".to_string())
+        );
+        assert_eq!(
+            config["models"]["providers"]["custom"]["models"],
+            serde_json::json!([
+                {
+                    "id": "gpt-4o-mini",
+                    "name": "gpt-4o-mini",
+                    "api": "openai-completions"
+                }
+            ])
         );
     }
 }
