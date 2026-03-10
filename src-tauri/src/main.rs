@@ -1001,15 +1001,6 @@ fn read_openclaw_config_value() -> Result<Value, String> {
     read_openclaw_config_value_from_path(&config_path)
 }
 
-fn read_openclaw_config_value_for_write() -> Result<Value, String> {
-    let config_path = openclaw_config_path()?;
-    if config_path.exists() {
-        read_openclaw_config_value_from_path(&config_path)
-    } else {
-        Ok(Value::Object(Map::new()))
-    }
-}
-
 fn write_openclaw_config_value(config: &Value) -> Result<(), String> {
     if !config.is_object() {
         return Err("config root must be a JSON object".to_string());
@@ -1046,28 +1037,6 @@ fn ensure_openclaw_cli_available() -> Result<(), String> {
         Ok(())
     } else {
         Err("OpenClaw CLI is not installed or not available".to_string())
-    }
-}
-
-fn root_object_mut(config: &mut Value) -> Result<&mut Map<String, Value>, String> {
-    config
-        .as_object_mut()
-        .ok_or_else(|| "config root must be a JSON object".to_string())
-}
-
-fn get_or_insert_object_field<'a>(
-    parent: &'a mut Map<String, Value>,
-    key: &str,
-    full_path: &str,
-) -> Result<&'a mut Map<String, Value>, String> {
-    if !parent.contains_key(key) {
-        parent.insert(key.to_string(), Value::Object(Map::new()));
-    }
-
-    match parent.get_mut(key) {
-        Some(Value::Object(object)) => Ok(object),
-        Some(_) => Err(format!("{full_path} must be a JSON object")),
-        None => Err(format!("failed to access {full_path}")),
     }
 }
 
@@ -1609,50 +1578,99 @@ fn write_openclaw_provider(
         );
     }
 
-    match read_openclaw_config_value_for_write() {
-        Ok(mut config) => {
-            let result = (|| -> Result<Value, String> {
-                let root = root_object_mut(&mut config)?;
-                let models = get_or_insert_object_field(root, "models", "models")?;
-                let providers =
-                    get_or_insert_object_field(models, "providers", "models.providers")?;
+    let provider_path = format!("models.providers.{provider_name}");
+    let default_model = default_model.trim().to_string();
+    let provider = serde_json::json!({
+        "baseUrl": base_url,
+        "apiKey": api_key,
+        "api": api,
+        "models": [{
+            "id": default_model,
+            "name": default_model,
+            "api": api,
+        }],
+    });
+    let provider_json = match serde_json::to_string(&provider) {
+        Ok(value) => value,
+        Err(error) => {
+            return CommandResponse::failure(
+                "Failed to write OpenClaw provider",
+                format!("failed to serialize provider JSON: {error}"),
+            )
+        }
+    };
 
-                let provider_snapshot = {
-                    let provider_value = providers
-                        .entry(provider_name.clone())
-                        .or_insert_with(|| Value::Object(Map::new()));
-                    let provider_object = provider_value.as_object_mut().ok_or_else(|| {
-                        format!("models.providers.{} must be a JSON object", provider_name)
-                    })?;
+    let set_exec = run_openclaw_command(&[
+        "config",
+        "set",
+        provider_path.as_str(),
+        provider_json.as_str(),
+        "--strict-json",
+    ]);
+    if set_exec.exit_code != 0 {
+        let error_detail = match (set_exec.stderr.trim(), set_exec.stdout.trim()) {
+            ("", "") => format!(
+                "openclaw config set failed with exit code {}",
+                set_exec.exit_code
+            ),
+            ("", stdout) => stdout.to_string(),
+            (stderr, "") => stderr.to_string(),
+            (stderr, stdout) => format!("{stderr}\n{stdout}"),
+        };
 
-                    provider_object.insert("baseUrl".to_string(), Value::String(base_url));
-                    provider_object.insert("apiKey".to_string(), Value::String(api_key));
-                    provider_object.insert("api".to_string(), Value::String(api.clone()));
+        return CommandResponse {
+            success: false,
+            stdout: set_exec.stdout,
+            stderr: error_detail,
+            exit_code: set_exec.exit_code,
+            message: "Failed to write OpenClaw provider".to_string(),
+            parsed_json: None,
+        };
+    }
 
-                    provider_object.insert(
-                        "models".to_string(),
-                        openclaw_provider_models_value(&default_model, Some(&api)),
-                    );
+    let get_exec = run_openclaw_command(&["config", "get", provider_path.as_str()]);
+    if get_exec.exit_code != 0 {
+        let error_detail = match (get_exec.stderr.trim(), get_exec.stdout.trim()) {
+            ("", "") => format!(
+                "openclaw config get failed with exit code {}",
+                get_exec.exit_code
+            ),
+            ("", stdout) => stdout.to_string(),
+            (stderr, "") => stderr.to_string(),
+            (stderr, stdout) => format!("{stderr}\n{stdout}"),
+        };
 
-                    Value::Object(provider_object.clone())
-                };
-                write_openclaw_config_value(&config)?;
-                Ok(provider_snapshot)
-            })();
+        return CommandResponse {
+            success: false,
+            stdout: get_exec.stdout,
+            stderr: error_detail,
+            exit_code: get_exec.exit_code,
+            message: "Failed to write OpenClaw provider".to_string(),
+            parsed_json: None,
+        };
+    }
 
-            match result {
-                Ok(provider) => CommandResponse {
-                    success: true,
-                    stdout: serde_json::to_string_pretty(&provider).unwrap_or_default(),
-                    stderr: String::new(),
-                    exit_code: 0,
-                    message: format!("Provider '{}' saved", provider_name),
-                    parsed_json: Some(provider),
-                },
-                Err(error) => CommandResponse::failure("Failed to write OpenClaw provider", error),
+    let provider_snapshot = match serde_json::from_str::<Value>(&get_exec.stdout) {
+        Ok(value) => value,
+        Err(error) => {
+            return CommandResponse {
+                success: false,
+                stdout: get_exec.stdout,
+                stderr: format!("failed to parse validated provider JSON: {error}"),
+                exit_code: get_exec.exit_code,
+                message: "Failed to write OpenClaw provider".to_string(),
+                parsed_json: None,
             }
         }
-        Err(error) => CommandResponse::failure("Failed to write OpenClaw provider", error),
+    };
+
+    CommandResponse {
+        success: true,
+        stdout: get_exec.stdout,
+        stderr: String::new(),
+        exit_code: 0,
+        message: format!("Provider '{}' saved", provider_name),
+        parsed_json: Some(provider_snapshot),
     }
 }
 

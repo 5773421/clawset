@@ -1,6 +1,6 @@
 [package]
 name = "clawset-desktop"
-version = "0.1.9"
+version = "0.2.0"
 description = "OpenClaw Desktop Controller"
 edition = "2021"
 
