@@ -7,6 +7,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const OPENCLAW_PROGRAM: &str = "openclaw";
+const OPENCLAW_COMPATIBILITY_VALUES: [&str; 8] = [
+    "openai-completions",
+    "openai-responses",
+    "openai-codex-responses",
+    "anthropic-messages",
+    "google-generative-ai",
+    "github-copilot",
+    "bedrock-converse-stream",
+    "ollama",
+];
 const OPENCLAW_ONBOARD_ARGS: [&str; 9] = [
     "onboard",
     "--install-daemon",
@@ -771,6 +781,61 @@ fn get_or_insert_object_field<'a>(
     }
 }
 
+fn normalize_openclaw_provider_api_value(api: &str) -> String {
+    let trimmed = api.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let normalized = trimmed.to_ascii_lowercase();
+    match normalized.as_str() {
+        "openai" | "azure-openai" => "openai-completions".to_string(),
+        "anthropic" => "anthropic-messages".to_string(),
+        "google" => "google-generative-ai".to_string(),
+        _ if OPENCLAW_COMPATIBILITY_VALUES.contains(&normalized.as_str()) => normalized,
+        _ => trimmed.to_string(),
+    }
+}
+
+fn migrate_openclaw_provider_api_values(config: &mut Value) -> Result<bool, String> {
+    let Some(root) = config.as_object_mut() else {
+        return Err("config root must be a JSON object".to_string());
+    };
+    let Some(models_value) = root.get_mut("models") else {
+        return Ok(false);
+    };
+    let Some(models) = models_value.as_object_mut() else {
+        return Err("models must be a JSON object".to_string());
+    };
+    let Some(providers_value) = models.get_mut("providers") else {
+        return Ok(false);
+    };
+    let Some(providers) = providers_value.as_object_mut() else {
+        return Err("models.providers must be a JSON object".to_string());
+    };
+
+    let mut changed = false;
+    for provider in providers.values_mut() {
+        let Some(provider_object) = provider.as_object_mut() else {
+            continue;
+        };
+        let Some(api_value) = provider_object.get_mut("api") else {
+            continue;
+        };
+        let Some(current_api) = api_value.as_str() else {
+            continue;
+        };
+
+        let normalized_api = normalize_openclaw_provider_api_value(current_api);
+        if normalized_api != current_api {
+            *api_value = Value::String(normalized_api);
+            changed = true;
+        }
+    }
+
+    Ok(changed)
+}
+
 fn extract_version_text(raw_stdout: &str) -> String {
     let lines = clean_non_empty_lines(raw_stdout);
     for line in lines.iter().rev() {
@@ -1081,7 +1146,17 @@ fn open_dashboard() -> CommandResponse {
 #[tauri::command]
 fn read_openclaw_providers() -> CommandResponse {
     match read_openclaw_config_value() {
-        Ok(config) => {
+        Ok(mut config) => {
+            let migration_warning = match migrate_openclaw_provider_api_values(&mut config) {
+                Ok(true) => write_openclaw_config_value(&config)
+                    .err()
+                    .map(|error| format!("Failed to persist compatibility migration: {error}")),
+                Ok(false) => None,
+                Err(error) => {
+                    return CommandResponse::failure("Failed to read OpenClaw providers", error)
+                }
+            };
+
             let Some(root) = config.as_object() else {
                 return CommandResponse::failure(
                     "Failed to read OpenClaw providers",
@@ -1107,7 +1182,7 @@ fn read_openclaw_providers() -> CommandResponse {
             CommandResponse {
                 success: true,
                 stdout,
-                stderr: String::new(),
+                stderr: migration_warning.unwrap_or_default(),
                 exit_code: 0,
                 message: "OpenClaw providers loaded".to_string(),
                 parsed_json: Some(providers),
@@ -1130,6 +1205,7 @@ fn write_openclaw_provider(
     }
 
     let provider_name = provider_name.trim().to_string();
+    let api = normalize_openclaw_provider_api_value(&api);
     if provider_name.is_empty() {
         return CommandResponse::failure(
             "Failed to write OpenClaw provider",
@@ -1445,6 +1521,74 @@ openclaw is /opt/homebrew/bin/openclaw
         assert_eq!(value, Value::Object(Map::new()));
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn normalizes_legacy_provider_api_values() {
+        assert_eq!(
+            normalize_openclaw_provider_api_value("openai"),
+            "openai-completions"
+        );
+        assert_eq!(
+            normalize_openclaw_provider_api_value("anthropic"),
+            "anthropic-messages"
+        );
+        assert_eq!(
+            normalize_openclaw_provider_api_value("google"),
+            "google-generative-ai"
+        );
+        assert_eq!(
+            normalize_openclaw_provider_api_value("azure-openai"),
+            "openai-completions"
+        );
+    }
+
+    #[test]
+    fn migrates_legacy_provider_api_values_in_config() {
+        let mut config = serde_json::json!({
+            "models": {
+                "providers": {
+                    "custom": {
+                        "api": "openai"
+                    },
+                    "anthropic": {
+                        "api": "anthropic"
+                    },
+                    "google": {
+                        "api": "google"
+                    },
+                    "azure": {
+                        "api": "azure-openai"
+                    },
+                    "already_valid": {
+                        "api": "ollama"
+                    }
+                }
+            }
+        });
+
+        let changed = migrate_openclaw_provider_api_values(&mut config).expect("migrate config");
+        assert!(changed);
+        assert_eq!(
+            config["models"]["providers"]["custom"]["api"],
+            Value::String("openai-completions".to_string())
+        );
+        assert_eq!(
+            config["models"]["providers"]["anthropic"]["api"],
+            Value::String("anthropic-messages".to_string())
+        );
+        assert_eq!(
+            config["models"]["providers"]["google"]["api"],
+            Value::String("google-generative-ai".to_string())
+        );
+        assert_eq!(
+            config["models"]["providers"]["azure"]["api"],
+            Value::String("openai-completions".to_string())
+        );
+        assert_eq!(
+            config["models"]["providers"]["already_valid"]["api"],
+            Value::String("ollama".to_string())
+        );
     }
 }
 

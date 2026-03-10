@@ -15,7 +15,16 @@ type StepId = "welcome" | "install" | "model" | "launch" | "success";
 type BusyAction = "check" | "install" | "connect" | "launch" | "enter" | null;
 type NoticeKind = "info" | "success" | "error";
 type ServicePresetId = "openai" | "kimi" | "glm" | "openrouter" | "custom";
-type CompatibilityModeId = "openai" | "anthropic" | "google" | "azure-openai" | "ollama" | "custom";
+type OpenclawCompatibilityValue =
+  | "openai-completions"
+  | "openai-responses"
+  | "openai-codex-responses"
+  | "anthropic-messages"
+  | "google-generative-ai"
+  | "github-copilot"
+  | "bedrock-converse-stream"
+  | "ollama";
+type CompatibilityModeId = OpenclawCompatibilityValue | "custom";
 type RowTone = "ready" | "neutral" | "missing";
 
 interface Notice {
@@ -117,7 +126,7 @@ const EMPTY_CONNECTION: AiConnectionSnapshot = {
 const DEFAULT_FORM: ServiceFormState = {
   providerName: "openai",
   baseUrl: "https://api.openai.com/v1",
-  api: "openai",
+  api: "openai-completions",
   defaultModel: "gpt-4o-mini",
   apiKey: "",
 };
@@ -126,7 +135,7 @@ const SERVICE_PRESETS: Record<ServicePresetId, ServicePreset> = {
   openai: {
     providerName: "openai",
     baseUrl: "https://api.openai.com/v1",
-    api: "openai",
+    api: "openai-completions",
     defaultModel: "gpt-4o-mini",
     label: { "zh-CN": "OpenAI", "en-US": "OpenAI" },
     hint: {
@@ -137,7 +146,7 @@ const SERVICE_PRESETS: Record<ServicePresetId, ServicePreset> = {
   kimi: {
     providerName: "kimi",
     baseUrl: "https://api.moonshot.cn/v1",
-    api: "openai",
+    api: "openai-completions",
     defaultModel: "moonshot-v1-8k",
     label: { "zh-CN": "Kimi", "en-US": "Kimi" },
     hint: {
@@ -148,7 +157,7 @@ const SERVICE_PRESETS: Record<ServicePresetId, ServicePreset> = {
   glm: {
     providerName: "glm",
     baseUrl: "https://open.bigmodel.cn/api/paas/v4",
-    api: "openai",
+    api: "openai-completions",
     defaultModel: "glm-4-flash",
     label: { "zh-CN": "GLM", "en-US": "GLM" },
     hint: {
@@ -159,7 +168,7 @@ const SERVICE_PRESETS: Record<ServicePresetId, ServicePreset> = {
   openrouter: {
     providerName: "openrouter",
     baseUrl: "https://openrouter.ai/api/v1",
-    api: "openai",
+    api: "openai-completions",
     defaultModel: "openai/gpt-4o-mini",
     label: { "zh-CN": "OpenRouter", "en-US": "OpenRouter" },
     hint: {
@@ -170,7 +179,7 @@ const SERVICE_PRESETS: Record<ServicePresetId, ServicePreset> = {
   custom: {
     providerName: "custom",
     baseUrl: "",
-    api: "openai",
+    api: "openai-completions",
     defaultModel: "",
     label: { "zh-CN": "其他兼容服务", "en-US": "Other compatible service" },
     hint: {
@@ -180,22 +189,52 @@ const SERVICE_PRESETS: Record<ServicePresetId, ServicePreset> = {
   },
 };
 
+const OPENCLAW_COMPATIBILITY_VALUES: OpenclawCompatibilityValue[] = [
+  "openai-completions",
+  "openai-responses",
+  "openai-codex-responses",
+  "anthropic-messages",
+  "google-generative-ai",
+  "github-copilot",
+  "bedrock-converse-stream",
+  "ollama",
+];
+
+const LEGACY_COMPATIBILITY_VALUE_ALIASES: Record<string, OpenclawCompatibilityValue> = {
+  openai: "openai-completions",
+  anthropic: "anthropic-messages",
+  google: "google-generative-ai",
+  "azure-openai": "openai-completions",
+};
+
 const COMPATIBILITY_MODE_OPTIONS: Record<CompatibilityModeId, CompatibilityModeOption> = {
-  openai: {
-    value: "openai",
-    label: { "zh-CN": "OpenAI 兼容", "en-US": "OpenAI compatible" },
+  "openai-completions": {
+    value: "openai-completions",
+    label: { "zh-CN": "OpenAI / Chat Completions", "en-US": "OpenAI / Chat Completions" },
   },
-  anthropic: {
-    value: "anthropic",
-    label: { "zh-CN": "Anthropic", "en-US": "Anthropic" },
+  "openai-responses": {
+    value: "openai-responses",
+    label: { "zh-CN": "OpenAI / Responses API", "en-US": "OpenAI / Responses API" },
   },
-  google: {
-    value: "google",
-    label: { "zh-CN": "Google / Gemini", "en-US": "Google / Gemini" },
+  "openai-codex-responses": {
+    value: "openai-codex-responses",
+    label: { "zh-CN": "OpenAI / Codex Responses", "en-US": "OpenAI / Codex Responses" },
   },
-  "azure-openai": {
-    value: "azure-openai",
-    label: { "zh-CN": "Azure OpenAI", "en-US": "Azure OpenAI" },
+  "anthropic-messages": {
+    value: "anthropic-messages",
+    label: { "zh-CN": "Anthropic / Messages", "en-US": "Anthropic / Messages" },
+  },
+  "google-generative-ai": {
+    value: "google-generative-ai",
+    label: { "zh-CN": "Google / Generative AI", "en-US": "Google / Generative AI" },
+  },
+  "github-copilot": {
+    value: "github-copilot",
+    label: { "zh-CN": "GitHub Copilot", "en-US": "GitHub Copilot" },
+  },
+  "bedrock-converse-stream": {
+    value: "bedrock-converse-stream",
+    label: { "zh-CN": "AWS Bedrock / ConverseStream", "en-US": "AWS Bedrock / ConverseStream" },
   },
   ollama: {
     value: "ollama",
@@ -206,6 +245,24 @@ const COMPATIBILITY_MODE_OPTIONS: Record<CompatibilityModeId, CompatibilityModeO
     label: { "zh-CN": "自定义", "en-US": "Custom" },
   },
 };
+
+function normalizeKnownCompatibilityValue(value: string): OpenclawCompatibilityValue | null {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const normalized = trimmed.toLowerCase();
+  if (normalized in LEGACY_COMPATIBILITY_VALUE_ALIASES) {
+    return LEGACY_COMPATIBILITY_VALUE_ALIASES[normalized];
+  }
+
+  if (OPENCLAW_COMPATIBILITY_VALUES.includes(normalized as OpenclawCompatibilityValue)) {
+    return normalized as OpenclawCompatibilityValue;
+  }
+
+  return null;
+}
 
 const I18N = {
   "zh-CN": {
@@ -770,21 +827,8 @@ function serviceLabelForProvider(locale: Locale, providerName: string, baseUrl: 
 }
 
 function compatibilityModeIdFromValue(value: string): CompatibilityModeId {
-  const normalized = value.trim().toLowerCase();
-
-  for (const [modeId, option] of Object.entries(COMPATIBILITY_MODE_OPTIONS) as Array<[
-    CompatibilityModeId,
-    CompatibilityModeOption,
-  ]>) {
-    if (modeId === "custom") {
-      continue;
-    }
-    if (option.value === normalized) {
-      return modeId;
-    }
-  }
-
-  return normalized ? "custom" : "openai";
+  const normalized = normalizeKnownCompatibilityValue(value);
+  return normalized ?? (value.trim() ? "custom" : "openai-completions");
 }
 
 function parseAiConnectionResponse(response: CommandResponse): AiConnectionSnapshot {
@@ -943,7 +987,7 @@ export default function App() {
   const [aiConnection, setAiConnection] = useState<AiConnectionSnapshot>(EMPTY_CONNECTION);
   const [selectedPreset, setSelectedPreset] = useState<ServicePresetId>("openai");
   const [showAdvancedFields, setShowAdvancedFields] = useState(false);
-  const [selectedCompatibilityMode, setSelectedCompatibilityMode] = useState<CompatibilityModeId>("openai");
+  const [selectedCompatibilityMode, setSelectedCompatibilityMode] = useState<CompatibilityModeId>("openai-completions");
   const [customCompatibilityValue, setCustomCompatibilityValue] = useState("");
   const [serviceForm, setServiceForm] = useState<ServiceFormState>(DEFAULT_FORM);
 
@@ -971,13 +1015,16 @@ export default function App() {
 
     const presetId = presetIdFromProvider(aiConnection.providerName, aiConnection.baseUrl);
     const preset = SERVICE_PRESETS[presetId];
-    const nextApi = aiConnection.api || preset.api || DEFAULT_FORM.api;
-    const nextCompatibilityMode = compatibilityModeIdFromValue(nextApi);
+    const nextApiSource = aiConnection.api || preset.api || DEFAULT_FORM.api;
+    const nextCompatibilityMode = compatibilityModeIdFromValue(nextApiSource);
+    const nextApi = nextCompatibilityMode === "custom"
+      ? nextApiSource.trim()
+      : COMPATIBILITY_MODE_OPTIONS[nextCompatibilityMode].value;
 
     setSelectedPreset(presetId);
     setShowAdvancedFields(presetId === "custom");
     setSelectedCompatibilityMode(nextCompatibilityMode);
-    setCustomCompatibilityValue(nextCompatibilityMode === "custom" ? nextApi : "");
+    setCustomCompatibilityValue(nextCompatibilityMode === "custom" ? nextApiSource.trim() : "");
     setServiceForm((current) => ({
       providerName: aiConnection.providerName || preset.providerName,
       baseUrl: aiConnection.baseUrl || preset.baseUrl,
@@ -1095,7 +1142,7 @@ export default function App() {
   async function handleConnectAi() {
     const compatibilityValue = selectedCompatibilityMode === "custom"
       ? customCompatibilityValue.trim()
-      : serviceForm.api.trim();
+      : COMPATIBILITY_MODE_OPTIONS[selectedCompatibilityMode].value;
 
     if (!serviceForm.apiKey.trim()) {
       setNotice({ kind: "error", text: copy.notices.keyRequired });
