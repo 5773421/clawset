@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const OPENCLAW_PROGRAM: &str = "openclaw";
+const DEFAULT_OPENCLAW_GATEWAY_PORT: u16 = 18789;
 const OPENCLAW_COMPATIBILITY_VALUES: [&str; 8] = [
     "openai-completions",
     "openai-responses",
@@ -17,18 +18,6 @@ const OPENCLAW_COMPATIBILITY_VALUES: [&str; 8] = [
     "bedrock-converse-stream",
     "ollama",
 ];
-const OPENCLAW_ONBOARD_ARGS: [&str; 9] = [
-    "onboard",
-    "--install-daemon",
-    "--accept-risk",
-    "--non-interactive",
-    "--skip-channels",
-    "--skip-search",
-    "--skip-skills",
-    "--skip-ui",
-    "--json",
-];
-
 #[derive(Debug, Clone)]
 struct ExecOutput {
     stdout: String,
@@ -528,6 +517,187 @@ fn clean_non_empty_lines(text: &str) -> Vec<String> {
 
 fn first_non_empty_cli_line(text: &str) -> Option<String> {
     clean_non_empty_lines(text).into_iter().next()
+}
+
+fn is_warning_only_cli_line(line: &str) -> bool {
+    let lower = line.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    lower.starts_with("warning:")
+        || lower.starts_with("warn:")
+        || lower.contains("running in non-interactive mode because stdin is not a tty")
+}
+
+fn is_non_actionable_cli_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.is_empty() {
+        return true;
+    }
+
+    is_warning_only_cli_line(trimmed)
+        || lower.starts_with("usage:")
+        || lower.starts_with("options:")
+        || lower.starts_with("🦞 openclaw")
+}
+
+fn first_actionable_cli_line(text: &str) -> Option<String> {
+    let lines = clean_non_empty_lines(text);
+    lines
+        .iter()
+        .find(|line| !is_non_actionable_cli_line(line))
+        .cloned()
+        .or_else(|| lines.into_iter().find(|line| !is_warning_only_cli_line(line)))
+}
+
+fn pick_actionable_cli_error_line(texts: &[&str]) -> Option<String> {
+    texts
+        .iter()
+        .find_map(|text| first_actionable_cli_line(text))
+        .or_else(|| texts.iter().find_map(|text| first_non_empty_cli_line(text)))
+}
+
+fn value_at_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    Some(current)
+}
+
+fn parse_port_value(value: &Value) -> Option<u16> {
+    match value {
+        Value::Number(number) => number.as_u64().and_then(|value| u16::try_from(value).ok()),
+        Value::String(text) => text.trim().parse::<u16>().ok(),
+        _ => None,
+    }
+}
+
+fn parse_boolish_signal(value: Option<&Value>, truthy: &[&str], falsy: &[&str]) -> Option<bool> {
+    let value = value?;
+    match value {
+        Value::Bool(flag) => Some(*flag),
+        Value::Number(number) => number.as_i64().map(|raw| raw > 0),
+        Value::String(text) => {
+            let normalized = text.trim().to_ascii_lowercase();
+            if normalized.is_empty() {
+                None
+            } else if truthy.iter().any(|token| normalized == *token) {
+                Some(true)
+            } else if falsy.iter().any(|token| normalized == *token) {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn gateway_service_loaded(status: &Value) -> bool {
+    parse_boolish_signal(
+        value_at_path(status, &["service", "loaded"]),
+        &["loaded", "running", "active", "ready", "ok"],
+        &["not loaded", "stopped", "inactive", "failed", "error"],
+    ) == Some(true)
+        || parse_boolish_signal(
+            value_at_path(status, &["service", "runtime", "status"]),
+            &["running", "active", "ready", "ok", "loaded"],
+            &["stopped", "inactive", "failed", "error", "not loaded"],
+        ) == Some(true)
+        || parse_boolish_signal(
+            value_at_path(status, &["service", "runtime", "state"]),
+            &["running", "active", "ready", "ok", "loaded"],
+            &["stopped", "inactive", "failed", "error", "not loaded"],
+        ) == Some(true)
+}
+
+fn gateway_local_ready(status: &Value) -> bool {
+    value_at_path(status, &["gateway", "probeUrl"])
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+        || parse_boolish_signal(
+            value_at_path(status, &["port", "status"]),
+            &["busy", "running", "active", "ready", "up", "ok", "listening"],
+            &["free", "stopped", "failed", "down", "offline", "error"],
+        ) == Some(true)
+        || value_at_path(status, &["port", "listeners"])
+            .and_then(Value::as_array)
+            .is_some_and(|listeners| !listeners.is_empty())
+}
+
+fn gateway_rpc_ready(status: &Value) -> bool {
+    parse_boolish_signal(
+        value_at_path(status, &["rpc", "ok"]),
+        &["true", "connected", "ready", "available", "ok"],
+        &["false", "not connected", "disconnected", "failed", "timeout", "error"],
+    ) == Some(true)
+        || parse_boolish_signal(
+            value_at_path(status, &["rpc", "status"]),
+            &["connected", "ready", "available", "ok"],
+            &["not connected", "disconnected", "failed", "timeout", "error"],
+        ) == Some(true)
+}
+
+fn gateway_status_is_ready(status: &Value) -> bool {
+    gateway_service_loaded(status) && gateway_local_ready(status) && gateway_rpc_ready(status)
+}
+
+fn configured_gateway_port(config: &Value) -> Option<u16> {
+    [
+        &["gateway", "port"][..],
+        &["gateway", "local", "port"],
+        &["gateway", "listen", "port"],
+        &["gateway", "server", "port"],
+        &["port"],
+    ]
+    .iter()
+    .find_map(|path| value_at_path(config, path).and_then(parse_port_value))
+}
+
+fn status_gateway_port(status: &Value) -> Option<u16> {
+    [
+        &["gateway", "port"][..],
+        &["port", "port"],
+        &["service", "command", "environment", "OPENCLAW_GATEWAY_PORT"],
+    ]
+    .iter()
+    .find_map(|path| value_at_path(status, path).and_then(parse_port_value))
+}
+
+fn launch_gateway_port(initial_status: Option<&Value>) -> u16 {
+    initial_status
+        .and_then(status_gateway_port)
+        .or_else(|| read_openclaw_config_value().ok().and_then(|config| configured_gateway_port(&config)))
+        .unwrap_or(DEFAULT_OPENCLAW_GATEWAY_PORT)
+}
+
+fn append_output_section(sections: &mut Vec<String>, label: &str, text: &str) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    sections.push(format!("{label}:\n{trimmed}"));
+}
+
+fn append_exec_output(
+    stdout_sections: &mut Vec<String>,
+    stderr_sections: &mut Vec<String>,
+    label: &str,
+    exec: &ExecOutput,
+) {
+    append_output_section(stdout_sections, &format!("{label} stdout"), &exec.stdout);
+    append_output_section(stderr_sections, &format!("{label} stderr"), &exec.stderr);
+    if exec.exit_code != 0 {
+        stderr_sections.push(format!("{label} exit_code: {}", exec.exit_code));
+    }
+}
+
+fn parse_json_stdout(exec: &ExecOutput) -> Option<Value> {
+    serde_json::from_str::<Value>(&exec.stdout).ok()
 }
 
 fn normalize_token(token: &str) -> &str {
@@ -1366,26 +1536,139 @@ fn write_openclaw_provider(
 }
 
 #[tauri::command]
-fn run_openclaw_onboard() -> CommandResponse {
+fn launch_openclaw() -> CommandResponse {
     if let Err(error) = migrate_openclaw_config_file_for_cli() {
-        return CommandResponse::failure("OpenClaw onboard failed", error);
+        return CommandResponse::failure("OpenClaw launch failed", error);
     }
 
-    let exec = run_openclaw_command(&OPENCLAW_ONBOARD_ARGS);
-    let parsed_json = serde_json::from_str::<Value>(&exec.stdout).ok();
+    let mut stdout_sections = Vec::new();
+    let mut stderr_sections = Vec::new();
 
-    let mut response = CommandResponse::from_exec(exec, "OpenClaw onboard command completed");
-    response.parsed_json = parsed_json;
-
-    if response.success {
-        response.message = "OpenClaw onboard completed".to_string();
-        return response;
+    let validate_exec = run_openclaw_command(&["config", "validate"]);
+    append_exec_output(
+        &mut stdout_sections,
+        &mut stderr_sections,
+        "config validate",
+        &validate_exec,
+    );
+    if validate_exec.exit_code != 0 {
+        let message = pick_actionable_cli_error_line(&[
+            &validate_exec.stderr,
+            &validate_exec.stdout,
+            "OpenClaw config validation failed",
+        ])
+        .unwrap_or_else(|| "OpenClaw config validation failed".to_string());
+        return CommandResponse {
+            success: false,
+            stdout: stdout_sections.join("\n\n"),
+            stderr: stderr_sections.join("\n\n"),
+            exit_code: validate_exec.exit_code,
+            message,
+            parsed_json: None,
+        };
     }
 
-    response.message = first_non_empty_cli_line(&response.stderr)
-        .or_else(|| first_non_empty_cli_line(&response.stdout))
-        .unwrap_or_else(|| "OpenClaw onboard failed".to_string());
-    response
+    let initial_status_exec = run_openclaw_command(&["gateway", "status", "--json"]);
+    let initial_status_json = parse_json_stdout(&initial_status_exec);
+    append_exec_output(
+        &mut stdout_sections,
+        &mut stderr_sections,
+        "gateway status (initial)",
+        &initial_status_exec,
+    );
+
+    if let Some(status) = initial_status_json.clone() {
+        if gateway_status_is_ready(&status) {
+            return CommandResponse {
+                success: true,
+                stdout: stdout_sections.join("\n\n"),
+                stderr: stderr_sections.join("\n\n"),
+                exit_code: 0,
+                message: "OpenClaw launch checks are already ready".to_string(),
+                parsed_json: Some(status),
+            };
+        }
+    }
+
+    let mut install_exec = None;
+
+    if !initial_status_json
+        .as_ref()
+        .is_some_and(gateway_service_loaded)
+    {
+        let gateway_port = launch_gateway_port(initial_status_json.as_ref());
+        let gateway_port_arg = gateway_port.to_string();
+        let exec = run_openclaw_command(&[
+            "gateway",
+            "install",
+            "--json",
+            "--runtime",
+            "node",
+            "--port",
+            gateway_port_arg.as_str(),
+        ]);
+        append_exec_output(
+            &mut stdout_sections,
+            &mut stderr_sections,
+            "gateway install",
+            &exec,
+        );
+        install_exec = Some(exec);
+    }
+
+    let start_exec = run_openclaw_command(&["gateway", "start", "--json"]);
+    append_exec_output(
+        &mut stdout_sections,
+        &mut stderr_sections,
+        "gateway start",
+        &start_exec,
+    );
+
+    let final_status_exec = run_openclaw_command(&["gateway", "status", "--json"]);
+    let final_status_json = parse_json_stdout(&final_status_exec);
+    append_exec_output(
+        &mut stdout_sections,
+        &mut stderr_sections,
+        "gateway status (final)",
+        &final_status_exec,
+    );
+
+    let success = final_status_json
+        .as_ref()
+        .is_some_and(gateway_status_is_ready);
+    let exit_code = if success {
+        0
+    } else if final_status_exec.exit_code != 0 {
+        final_status_exec.exit_code
+    } else if start_exec.exit_code != 0 {
+        start_exec.exit_code
+    } else {
+        1
+    };
+    let message = if success {
+        "OpenClaw startup checks are ready".to_string()
+    } else {
+        pick_actionable_cli_error_line(&[
+            install_exec.as_ref().map(|exec| exec.stderr.as_str()).unwrap_or(""),
+            install_exec.as_ref().map(|exec| exec.stdout.as_str()).unwrap_or(""),
+            &final_status_exec.stderr,
+            &final_status_exec.stdout,
+            &start_exec.stderr,
+            &start_exec.stdout,
+            &initial_status_exec.stderr,
+            &initial_status_exec.stdout,
+        ])
+        .unwrap_or_else(|| "OpenClaw launch failed".to_string())
+    };
+
+    CommandResponse {
+        success,
+        stdout: stdout_sections.join("\n\n"),
+        stderr: stderr_sections.join("\n\n"),
+        exit_code,
+        message,
+        parsed_json: final_status_json,
+    }
 }
 
 #[cfg(test)]
@@ -1408,11 +1691,51 @@ mod tests {
     }
 
     #[test]
-    fn onboard_args_use_non_interactive_json_flow() {
-        assert!(OPENCLAW_ONBOARD_ARGS.contains(&"--non-interactive"));
-        assert!(OPENCLAW_ONBOARD_ARGS.contains(&"--accept-risk"));
-        assert!(OPENCLAW_ONBOARD_ARGS.contains(&"--json"));
-        assert!(!OPENCLAW_ONBOARD_ARGS.contains(&"--no-prompt"));
+    fn picks_actionable_cli_line_after_warning_only_prefix() {
+        let raw = "warning: Running in non-interactive mode because stdin is not a TTY.\nError: config file is invalid";
+        assert_eq!(
+            first_actionable_cli_line(raw),
+            Some("Error: config file is invalid".to_string())
+        );
+    }
+
+    #[test]
+    fn gateway_status_readiness_requires_rpc() {
+        let status = serde_json::json!({
+            "service": {
+                "loaded": true,
+                "runtime": {
+                    "status": "running",
+                    "state": "active"
+                }
+            },
+            "gateway": {
+                "probeUrl": "ws://127.0.0.1:18789"
+            },
+            "port": {
+                "status": "busy",
+                "listeners": [{ "pid": 1 }]
+            },
+            "rpc": {
+                "ok": false
+            }
+        });
+
+        assert!(gateway_service_loaded(&status));
+        assert!(gateway_local_ready(&status));
+        assert!(!gateway_rpc_ready(&status));
+        assert!(!gateway_status_is_ready(&status));
+    }
+
+    #[test]
+    fn configured_gateway_port_prefers_known_paths() {
+        let config = serde_json::json!({
+            "gateway": {
+                "port": 18888
+            }
+        });
+
+        assert_eq!(configured_gateway_port(&config), Some(18888));
     }
 
     #[test]
@@ -1769,7 +2092,7 @@ fn main() {
             open_dashboard,
             read_openclaw_providers,
             write_openclaw_provider,
-            run_openclaw_onboard
+            launch_openclaw
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

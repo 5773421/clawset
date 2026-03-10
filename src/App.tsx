@@ -3,9 +3,9 @@ import {
   detectOpenclaw,
   gatewayStatus as getLaunchStatus,
   installOpenclaw,
+  launchOpenclaw,
   openDashboard as openOpenclawHome,
   readOpenclawProviders as readAiConnections,
-  runOpenclawOnboard,
   writeOpenclawProvider as saveAiConnection,
 } from "./lib/tauri";
 import type { CommandResponse } from "./types";
@@ -302,8 +302,8 @@ const I18N = {
       customRequired: "请补全服务地址、兼容模式和默认模型。",
       launchSuccess: "OpenClaw 已完成启动与初始化。",
       launchFailed: "OpenClaw 启动或初始化失败。",
-      launchRecovered: "初始化命令返回了错误，但当前状态看起来已经可用。",
-      launchIncomplete: "初始化命令已执行，但还有一项启动检查没有通过。",
+      launchRecovered: "启动流程返回了错误，但当前状态看起来已经可用。",
+      launchIncomplete: "启动检查已执行，但还有一项检查没有通过。",
       openSuccess: "正在打开 OpenClaw。",
       openFailed: "未能打开 OpenClaw。",
     },
@@ -434,8 +434,8 @@ const I18N = {
       customRequired: "Fill in the service URL, compatibility mode, and default model.",
       launchSuccess: "OpenClaw finished startup and first-time initialization.",
       launchFailed: "OpenClaw could not finish startup or initialization.",
-      launchRecovered: "The onboard command returned an error, but the current status now looks usable.",
-      launchIncomplete: "The onboard command ran, but one startup check still needs attention.",
+      launchRecovered: "Startup reported an error, but the current status now looks usable.",
+      launchIncomplete: "Startup checks ran, but one startup check still needs attention.",
       openSuccess: "Opening OpenClaw.",
       openFailed: "Could not open OpenClaw.",
     },
@@ -577,6 +577,41 @@ function firstLine(value: string): string {
 
 function firstNonEmpty(...values: string[]): string {
   return values.map((value) => value.trim()).find(Boolean) ?? "";
+}
+
+function isWarningOnlyDetailLine(line: string): boolean {
+  const normalized = line.trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  return normalized.startsWith("warning:")
+    || normalized.startsWith("warn:")
+    || normalized.includes("running in non-interactive mode because stdin is not a tty");
+}
+
+function isNonActionableDetailLine(line: string): boolean {
+  const normalized = line.trim().toLowerCase();
+  if (!normalized) {
+    return true;
+  }
+
+  return isWarningOnlyDetailLine(line)
+    || normalized.startsWith("usage:")
+    || normalized.startsWith("options:")
+    || normalized.startsWith("🦞 openclaw")
+    || normalized.endsWith(" stdout:")
+    || normalized.endsWith(" stderr:")
+    || normalized.includes(" exit_code:");
+}
+
+function firstActionableDetailLine(value: string): string {
+  const lines = value
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  return lines.find((line) => !isNonActionableDetailLine(line)) ?? lines[0] ?? "";
 }
 
 function mergeNoticeText(...values: string[]): string {
@@ -935,7 +970,11 @@ function nextBlockingStep(
 }
 
 function commandErrorDetail(response: CommandResponse): string {
-  return firstNonEmpty(firstLine(response.stderr), firstLine(response.stdout), firstLine(response.message));
+  return firstNonEmpty(
+    firstActionableDetailLine(response.stderr),
+    firstActionableDetailLine(response.stdout),
+    firstActionableDetailLine(response.message),
+  );
 }
 
 function launchStatusValue(copy: Copy, value: boolean | null): string {
@@ -1215,7 +1254,7 @@ export default function App() {
 
   async function handleLaunch() {
     setBusyAction("launch");
-    const response = await runOpenclawOnboard();
+    const response = await launchOpenclaw();
     const snapshots = await syncState(true, { announce: false });
     const detail = commandErrorDetail(response);
     const launchDetail = launchSummaryText(snapshots.launch, copy);

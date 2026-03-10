@@ -67,6 +67,6 @@ export function writeOpenclawProvider(payload: WriteOpenclawProviderPayload) {
   });
 }
 
-export function runOpenclawOnboard() {
-  return call("run_openclaw_onboard");
+export function launchOpenclaw() {
+  return call("launch_openclaw");
 }
