@@ -8,6 +8,7 @@ use std::process::Command;
 
 const OPENCLAW_PROGRAM: &str = "openclaw";
 const DEFAULT_OPENCLAW_GATEWAY_PORT: u16 = 18789;
+const GATEWAY_STATUS_RETRY_DELAYS_MS: [u64; 4] = [300, 500, 800, 800];
 const OPENCLAW_COMPATIBILITY_VALUES: [&str; 8] = [
     "openai-completions",
     "openai-responses",
@@ -23,6 +24,13 @@ struct ExecOutput {
     stdout: String,
     stderr: String,
     exit_code: i32,
+}
+
+#[derive(Debug, Clone)]
+struct GatewayStatusRetryOutcome {
+    last_exec: ExecOutput,
+    last_status: Option<Value>,
+    recovered: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -549,7 +557,11 @@ fn first_actionable_cli_line(text: &str) -> Option<String> {
         .iter()
         .find(|line| !is_non_actionable_cli_line(line))
         .cloned()
-        .or_else(|| lines.into_iter().find(|line| !is_warning_only_cli_line(line)))
+        .or_else(|| {
+            lines
+                .into_iter()
+                .find(|line| !is_warning_only_cli_line(line))
+        })
 }
 
 fn pick_actionable_cli_error_line(texts: &[&str]) -> Option<String> {
@@ -620,7 +632,15 @@ fn gateway_local_ready(status: &Value) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
         || parse_boolish_signal(
             value_at_path(status, &["port", "status"]),
-            &["busy", "running", "active", "ready", "up", "ok", "listening"],
+            &[
+                "busy",
+                "running",
+                "active",
+                "ready",
+                "up",
+                "ok",
+                "listening",
+            ],
             &["free", "stopped", "failed", "down", "offline", "error"],
         ) == Some(true)
         || value_at_path(status, &["port", "listeners"])
@@ -632,17 +652,109 @@ fn gateway_rpc_ready(status: &Value) -> bool {
     parse_boolish_signal(
         value_at_path(status, &["rpc", "ok"]),
         &["true", "connected", "ready", "available", "ok"],
-        &["false", "not connected", "disconnected", "failed", "timeout", "error"],
+        &[
+            "false",
+            "not connected",
+            "disconnected",
+            "failed",
+            "timeout",
+            "error",
+        ],
     ) == Some(true)
         || parse_boolish_signal(
             value_at_path(status, &["rpc", "status"]),
             &["connected", "ready", "available", "ok"],
-            &["not connected", "disconnected", "failed", "timeout", "error"],
+            &[
+                "not connected",
+                "disconnected",
+                "failed",
+                "timeout",
+                "error",
+            ],
         ) == Some(true)
 }
 
 fn gateway_status_is_ready(status: &Value) -> bool {
     gateway_service_loaded(status) && gateway_local_ready(status) && gateway_rpc_ready(status)
+}
+
+fn gateway_status_needs_rpc_recovery(status: &Value) -> bool {
+    gateway_service_loaded(status) && gateway_local_ready(status) && !gateway_rpc_ready(status)
+}
+
+fn text_looks_like_transient_gateway_reload(text: &str) -> bool {
+    let lower = strip_ansi_sequences(text).to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    [
+        "config overwrite",
+        "gateway closed",
+        "abnormal closure",
+        "no close reason",
+        "no close frame",
+        "websocket reset",
+        "websocket closed",
+        "ws reset",
+        "ws closed",
+        "connection reset",
+        "reset by peer",
+        "broken pipe",
+        "rpc disconnected",
+    ]
+    .iter()
+    .any(|token| lower.contains(token))
+}
+
+fn command_output_looks_like_transient_gateway_reload(exec: &ExecOutput) -> bool {
+    text_looks_like_transient_gateway_reload(&exec.stdout)
+        || text_looks_like_transient_gateway_reload(&exec.stderr)
+}
+
+fn retry_gateway_status_until_ready(
+    stdout_sections: &mut Vec<String>,
+    stderr_sections: &mut Vec<String>,
+) -> GatewayStatusRetryOutcome {
+    append_output_section(
+        stderr_sections,
+        "gateway retry",
+        "Transient gateway reload suspected; polling gateway status for recovery.",
+    );
+
+    let mut last_exec = ExecOutput {
+        stdout: String::new(),
+        stderr: String::new(),
+        exit_code: -1,
+    };
+    let mut last_status = None;
+    let mut recovered = false;
+
+    for (attempt, delay_ms) in GATEWAY_STATUS_RETRY_DELAYS_MS.iter().enumerate() {
+        std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
+
+        let exec = run_openclaw_command(&["gateway", "status", "--json"]);
+        let status = parse_json_stdout(&exec);
+        append_exec_output(
+            stdout_sections,
+            stderr_sections,
+            &format!("gateway status retry {}", attempt + 1),
+            &exec,
+        );
+
+        recovered = status.as_ref().is_some_and(gateway_status_is_ready);
+        last_exec = exec;
+        last_status = status;
+        if recovered {
+            break;
+        }
+    }
+
+    GatewayStatusRetryOutcome {
+        last_exec,
+        last_status,
+        recovered,
+    }
 }
 
 fn configured_gateway_port(config: &Value) -> Option<u16> {
@@ -670,7 +782,11 @@ fn status_gateway_port(status: &Value) -> Option<u16> {
 fn launch_gateway_port(initial_status: Option<&Value>) -> u16 {
     initial_status
         .and_then(status_gateway_port)
-        .or_else(|| read_openclaw_config_value().ok().and_then(|config| configured_gateway_port(&config)))
+        .or_else(|| {
+            read_openclaw_config_value()
+                .ok()
+                .and_then(|config| configured_gateway_port(&config))
+        })
         .unwrap_or(DEFAULT_OPENCLAW_GATEWAY_PORT)
 }
 
@@ -904,8 +1020,12 @@ fn write_openclaw_config_value(config: &Value) -> Result<(), String> {
         .map_err(|err| format!("failed to serialize config JSON: {err}"))?;
     serialized.push('\n');
 
-    std::fs::write(&config_path, serialized)
-        .map_err(|err| format!("failed to write config file {}: {err}", config_path.display()))
+    std::fs::write(&config_path, serialized).map_err(|err| {
+        format!(
+            "failed to write config file {}: {err}",
+            config_path.display()
+        )
+    })
 }
 
 fn openclaw_cli_available(context: &OpenclawExecutionContext) -> bool {
@@ -1422,15 +1542,16 @@ fn open_dashboard() -> CommandResponse {
 fn read_openclaw_providers() -> CommandResponse {
     match read_openclaw_config_value() {
         Ok(mut config) => {
-            let migration_warning = match migrate_openclaw_provider_compatibility_values(&mut config) {
-                Ok(true) => write_openclaw_config_value(&config)
-                    .err()
-                    .map(|error| format!("Failed to persist compatibility migration: {error}")),
-                Ok(false) => None,
-                Err(error) => {
-                    return CommandResponse::failure("Failed to read OpenClaw providers", error)
-                }
-            };
+            let migration_warning =
+                match migrate_openclaw_provider_compatibility_values(&mut config) {
+                    Ok(true) => write_openclaw_config_value(&config)
+                        .err()
+                        .map(|error| format!("Failed to persist compatibility migration: {error}")),
+                    Ok(false) => None,
+                    Err(error) => {
+                        return CommandResponse::failure("Failed to read OpenClaw providers", error)
+                    }
+                };
 
             let Some(root) = config.as_object() else {
                 return CommandResponse::failure(
@@ -1625,7 +1746,7 @@ fn launch_openclaw() -> CommandResponse {
     );
 
     let final_status_exec = run_openclaw_command(&["gateway", "status", "--json"]);
-    let final_status_json = parse_json_stdout(&final_status_exec);
+    let mut final_status_json = parse_json_stdout(&final_status_exec);
     append_exec_output(
         &mut stdout_sections,
         &mut stderr_sections,
@@ -1633,11 +1754,43 @@ fn launch_openclaw() -> CommandResponse {
         &final_status_exec,
     );
 
-    let success = final_status_json
+    let mut success = final_status_json
         .as_ref()
         .is_some_and(gateway_status_is_ready);
+    let should_retry_gateway_status = !success
+        && (initial_status_json
+            .as_ref()
+            .is_some_and(gateway_status_needs_rpc_recovery)
+            || final_status_json
+                .as_ref()
+                .is_some_and(gateway_status_needs_rpc_recovery)
+            || command_output_looks_like_transient_gateway_reload(&initial_status_exec)
+            || command_output_looks_like_transient_gateway_reload(&start_exec)
+            || command_output_looks_like_transient_gateway_reload(&final_status_exec)
+            || install_exec
+                .as_ref()
+                .is_some_and(command_output_looks_like_transient_gateway_reload));
+
+    let mut retry_outcome = None;
+    if should_retry_gateway_status {
+        let outcome = retry_gateway_status_until_ready(&mut stdout_sections, &mut stderr_sections);
+        success = outcome.recovered;
+        if outcome.last_status.is_some() {
+            final_status_json = outcome.last_status.clone();
+        }
+        retry_outcome = Some(outcome);
+    }
+
     let exit_code = if success {
         0
+    } else if retry_outcome
+        .as_ref()
+        .is_some_and(|outcome| outcome.last_exec.exit_code != 0)
+    {
+        retry_outcome
+            .as_ref()
+            .map(|outcome| outcome.last_exec.exit_code)
+            .unwrap_or(1)
     } else if final_status_exec.exit_code != 0 {
         final_status_exec.exit_code
     } else if start_exec.exit_code != 0 {
@@ -1646,11 +1799,32 @@ fn launch_openclaw() -> CommandResponse {
         1
     };
     let message = if success {
-        "OpenClaw startup checks are ready".to_string()
+        if retry_outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.recovered)
+        {
+            "OpenClaw startup checks recovered after a transient gateway reconnect".to_string()
+        } else {
+            "OpenClaw startup checks are ready".to_string()
+        }
     } else {
         pick_actionable_cli_error_line(&[
-            install_exec.as_ref().map(|exec| exec.stderr.as_str()).unwrap_or(""),
-            install_exec.as_ref().map(|exec| exec.stdout.as_str()).unwrap_or(""),
+            retry_outcome
+                .as_ref()
+                .map(|outcome| outcome.last_exec.stderr.as_str())
+                .unwrap_or(""),
+            retry_outcome
+                .as_ref()
+                .map(|outcome| outcome.last_exec.stdout.as_str())
+                .unwrap_or(""),
+            install_exec
+                .as_ref()
+                .map(|exec| exec.stderr.as_str())
+                .unwrap_or(""),
+            install_exec
+                .as_ref()
+                .map(|exec| exec.stdout.as_str())
+                .unwrap_or(""),
             &final_status_exec.stderr,
             &final_status_exec.stdout,
             &start_exec.stderr,
@@ -1725,6 +1899,21 @@ mod tests {
         assert!(gateway_local_ready(&status));
         assert!(!gateway_rpc_ready(&status));
         assert!(!gateway_status_is_ready(&status));
+        assert!(gateway_status_needs_rpc_recovery(&status));
+    }
+
+    #[test]
+    fn detects_transient_gateway_reload_output() {
+        let raw = "\
+Config overwrite: ~/.openclaw/openclaw.json
+gateway closed (1006 abnormal closure (no close frame)): no close reason";
+        assert!(text_looks_like_transient_gateway_reload(raw));
+    }
+
+    #[test]
+    fn ignores_non_transient_gateway_output() {
+        let raw = "Error: OpenClaw config validation failed";
+        assert!(!text_looks_like_transient_gateway_reload(raw));
     }
 
     #[test]

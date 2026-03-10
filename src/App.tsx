@@ -614,6 +614,27 @@ function firstActionableDetailLine(value: string): string {
   return lines.find((line) => !isNonActionableDetailLine(line)) ?? lines[0] ?? "";
 }
 
+function isTransientGatewayDetail(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  return [
+    "config overwrite",
+    "gateway closed",
+    "abnormal closure",
+    "no close reason",
+    "no close frame",
+    "websocket reset",
+    "websocket closed",
+    "ws reset",
+    "ws closed",
+    "connection reset",
+    "reset by peer",
+  ].some((token) => normalized.includes(token));
+}
+
 function mergeNoticeText(...values: string[]): string {
   const seen = new Set<string>();
   const parts = values
@@ -1260,9 +1281,10 @@ export default function App() {
     const launchDetail = launchSummaryText(snapshots.launch, copy);
 
     if (isLaunchReady(snapshots.launch)) {
+      const recoveredDetail = response.success || isTransientGatewayDetail(detail) ? "" : detail;
       setNotice({
         kind: "success",
-        text: response.success ? copy.notices.launchSuccess : mergeNoticeText(copy.notices.launchRecovered, detail),
+        text: response.success ? copy.notices.launchSuccess : mergeNoticeText(copy.notices.launchRecovered, recoveredDetail),
       });
       return;
     }
