@@ -93,7 +93,11 @@ fn run_command_with_path(program: &str, args: &[&str], path_override: Option<&st
 }
 
 fn run_shell(command: &str) -> ExecOutput {
-    run_command("sh", &["-lc", command])
+    run_shell_with_path(command, None)
+}
+
+fn run_shell_with_path(command: &str, path_override: Option<&str>) -> ExecOutput {
+    run_command_with_path("sh", &["-lc", command], path_override)
 }
 
 #[derive(Debug, Clone)]
@@ -340,11 +344,21 @@ fn build_augmented_exec_path(
     executable_path: Option<&str>,
     node_path: Option<&str>,
 ) -> Option<String> {
+    build_path_override_from_candidates(
+        known_exec_path_candidates(executable_path, node_path),
+        true,
+    )
+}
+
+fn build_path_override_from_candidates(
+    candidates: Vec<PathBuf>,
+    require_existing_dirs: bool,
+) -> Option<String> {
     let mut ordered_paths = Vec::new();
     let mut seen = HashSet::new();
 
-    for candidate in known_exec_path_candidates(executable_path, node_path) {
-        if !candidate.is_dir() {
+    for candidate in candidates {
+        if require_existing_dirs && !candidate.is_dir() {
             continue;
         }
         let key = candidate.to_string_lossy().to_string();
@@ -372,6 +386,15 @@ fn build_augmented_exec_path(
     std::env::join_paths(ordered_paths)
         .ok()
         .map(|value| value.to_string_lossy().to_string())
+}
+
+fn build_install_shell_path() -> Option<String> {
+    build_path_override_from_candidates(known_exec_path_candidates(None, None), false)
+}
+
+#[cfg(target_os = "macos")]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn choose_openclaw_launch_strategy(
@@ -546,9 +569,16 @@ fn is_non_actionable_cli_line(line: &str) -> bool {
     }
 
     is_warning_only_cli_line(trimmed)
+        || trimmed.starts_with("==>")
         || lower.starts_with("usage:")
         || lower.starts_with("options:")
         || lower.starts_with("🦞 openclaw")
+        || lower == "stdout:"
+        || lower == "stderr:"
+        || lower == "exit_code:"
+        || lower.ends_with(" stdout:")
+        || lower.ends_with(" stderr:")
+        || lower.ends_with(" exit_code:")
 }
 
 fn first_actionable_cli_line(text: &str) -> Option<String> {
@@ -710,6 +740,11 @@ fn text_looks_like_transient_gateway_reload(text: &str) -> bool {
 fn command_output_looks_like_transient_gateway_reload(exec: &ExecOutput) -> bool {
     text_looks_like_transient_gateway_reload(&exec.stdout)
         || text_looks_like_transient_gateway_reload(&exec.stderr)
+}
+
+fn should_retry_gateway_status_snapshot(exec: &ExecOutput, status: Option<&Value>) -> bool {
+    status.is_some_and(gateway_status_needs_rpc_recovery)
+        || command_output_looks_like_transient_gateway_reload(exec)
 }
 
 fn retry_gateway_status_until_ready(
@@ -1255,6 +1290,36 @@ fn line_seems_banner_noise(line: &str) -> bool {
     line.chars().all(|ch| !ch.is_ascii_alphanumeric())
 }
 
+#[cfg(target_os = "macos")]
+fn openclaw_install_prefix() -> Result<String, String> {
+    home_dir()
+        .map(|home| home.join(".openclaw").to_string_lossy().to_string())
+        .ok_or_else(|| "HOME directory is not available".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn install_openclaw_shell_command() -> Result<String, String> {
+    let prefix = shell_quote(openclaw_install_prefix()?.as_str());
+    Ok(format!(
+        "export OPENCLAW_PREFIX={prefix}; \
+export OPENCLAW_NO_ONBOARD=1; \
+export OPENCLAW_NPM_LOGLEVEL=warn; \
+export SHARP_IGNORE_GLOBAL_LIBVIPS=1; \
+curl -fsSL --proto '=https' --tlsv1.2 https://openclaw.ai/install-cli.sh | bash -s -- --json --prefix \"$OPENCLAW_PREFIX\" --no-onboard"
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_openclaw_shell_command() -> Result<String, String> {
+    Ok(
+        "export OPENCLAW_NO_ONBOARD=1; \
+export OPENCLAW_NPM_LOGLEVEL=warn; \
+export SHARP_IGNORE_GLOBAL_LIBVIPS=1; \
+curl -fsSL --proto '=https' --tlsv1.2 https://openclaw.ai/install.sh | bash -s -- --no-onboard --no-prompt"
+            .to_string(),
+    )
+}
+
 fn extract_url(text: &str) -> Option<String> {
     text.split_whitespace().find_map(|item| {
         let cleaned = item.trim_matches(|c: char| c == '"' || c == '\'' || c == ',' || c == ';');
@@ -1424,12 +1489,22 @@ fn detect_openclaw() -> CommandResponse {
 
 #[tauri::command]
 fn install_openclaw() -> CommandResponse {
-    let exec = run_shell(
-        "curl -fsSL --proto '=https' --tlsv1.2 https://openclaw.ai/install.sh | bash -s -- --no-onboard --no-prompt",
-    );
+    let command = match install_openclaw_shell_command() {
+        Ok(command) => command,
+        Err(error) => return CommandResponse::failure("OpenClaw install failed", error),
+    };
+    let install_path = build_install_shell_path();
+    let exec = run_shell_with_path(command.as_str(), install_path.as_deref());
     let mut response = CommandResponse::from_exec(exec, "Install command finished");
     if response.success {
-        response.message = "OpenClaw install completed".to_string();
+        #[cfg(target_os = "macos")]
+        {
+            response.message = "OpenClaw install completed under ~/.openclaw".to_string();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            response.message = "OpenClaw install completed".to_string();
+        }
     } else {
         response.message = "OpenClaw install failed".to_string();
     }
@@ -1442,11 +1517,49 @@ fn gateway_status() -> CommandResponse {
         return CommandResponse::failure("Failed to fetch gateway status", error);
     }
 
-    let exec = run_openclaw_command(&["gateway", "status", "--json"]);
-    let parsed_json = serde_json::from_str::<Value>(&exec.stdout).ok();
+    let mut stdout_sections = Vec::new();
+    let mut stderr_sections = Vec::new();
 
-    let mut response = CommandResponse::from_exec(exec, "Gateway status fetched");
-    response.parsed_json = parsed_json;
+    let exec = run_openclaw_command(&["gateway", "status", "--json"]);
+    let mut parsed_json = parse_json_stdout(&exec);
+    append_exec_output(
+        &mut stdout_sections,
+        &mut stderr_sections,
+        "gateway status",
+        &exec,
+    );
+
+    let mut effective_exec = exec.clone();
+    let mut recovered = false;
+    if should_retry_gateway_status_snapshot(&exec, parsed_json.as_ref()) {
+        let outcome = retry_gateway_status_until_ready(&mut stdout_sections, &mut stderr_sections);
+        if outcome.last_status.is_some() {
+            parsed_json = outcome.last_status.clone();
+        }
+        if outcome.recovered || outcome.last_exec.exit_code == 0 {
+            effective_exec = outcome.last_exec.clone();
+        }
+        recovered = outcome.recovered;
+    }
+
+    let mut response = CommandResponse {
+        success: recovered || effective_exec.exit_code == 0,
+        stdout: stdout_sections.join("\n\n"),
+        stderr: stderr_sections.join("\n\n"),
+        exit_code: if recovered {
+            0
+        } else {
+            effective_exec.exit_code
+        },
+        message: if recovered {
+            "Gateway status recovered after a transient gateway reconnect".to_string()
+        } else if effective_exec.exit_code == 0 {
+            "Gateway status fetched".to_string()
+        } else {
+            "Failed to fetch gateway status".to_string()
+        },
+        parsed_json,
+    };
     if response.success && response.parsed_json.is_none() {
         response.message = "Gateway status fetched but stdout is not valid JSON".to_string();
     }
@@ -1892,6 +2005,15 @@ mod tests {
     }
 
     #[test]
+    fn ignores_homebrew_stage_lines_when_picking_actionable_cli_line() {
+        let raw = "==> Checking for `sudo` access (which may request your password)...\nError: Homebrew is not installed";
+        assert_eq!(
+            first_actionable_cli_line(raw),
+            Some("Error: Homebrew is not installed".to_string())
+        );
+    }
+
+    #[test]
     fn gateway_status_readiness_requires_rpc() {
         let status = serde_json::json!({
             "service": {
@@ -1918,6 +2040,48 @@ mod tests {
         assert!(!gateway_rpc_ready(&status));
         assert!(!gateway_status_is_ready(&status));
         assert!(gateway_status_needs_rpc_recovery(&status));
+    }
+
+    #[test]
+    fn gateway_status_snapshot_retries_when_only_rpc_is_pending() {
+        let status = serde_json::json!({
+            "service": {
+                "loaded": true,
+                "runtime": {
+                    "status": "running",
+                    "state": "active"
+                }
+            },
+            "gateway": {
+                "probeUrl": "ws://127.0.0.1:18789"
+            },
+            "port": {
+                "status": "busy",
+                "listeners": [{ "pid": 1 }]
+            },
+            "rpc": {
+                "ok": false
+            }
+        });
+        let exec = ExecOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+        };
+
+        assert!(should_retry_gateway_status_snapshot(&exec, Some(&status)));
+    }
+
+    #[test]
+    fn gateway_status_snapshot_retries_on_transient_gateway_close_output() {
+        let exec = ExecOutput {
+            stdout: String::new(),
+            stderr: "gateway closed (1006 abnormal closure (no close frame)): no close reason"
+                .to_string(),
+            exit_code: 1,
+        };
+
+        assert!(should_retry_gateway_status_snapshot(&exec, None));
     }
 
     #[test]
@@ -2018,6 +2182,42 @@ openclaw is /opt/homebrew/bin/openclaw
             "/opt/homebrew/bin/openclaw",
             &exec
         ));
+    }
+
+    #[test]
+    fn install_shell_path_seeds_common_gui_paths() {
+        let path = build_install_shell_path().expect("install shell path");
+        assert!(path.contains("/opt/homebrew/bin"));
+        assert!(path.contains("/usr/local/bin"));
+        if let Some(home) = home_dir() {
+            let openclaw_bin = home.join(".openclaw").join("bin");
+            let local_bin = home.join(".local").join("bin");
+            let nvm_bin = home.join(".nvm").join("current").join("bin");
+            assert!(path.contains(openclaw_bin.to_string_lossy().as_ref()));
+            assert!(path.contains(local_bin.to_string_lossy().as_ref()));
+            assert!(path.contains(nvm_bin.to_string_lossy().as_ref()));
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_install_command_uses_local_prefix_installer() {
+        let command = install_openclaw_shell_command().expect("macOS install command");
+        assert!(command.contains("install-cli.sh"));
+        assert!(command.contains("--json"));
+        assert!(command.contains("--no-onboard"));
+        assert!(command.contains("--prefix \"$OPENCLAW_PREFIX\""));
+        assert!(command.contains("OPENCLAW_PREFIX="));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn linux_install_command_keeps_install_sh_flow() {
+        let command = install_openclaw_shell_command().expect("Linux install command");
+        assert!(command.contains("install.sh"));
+        assert!(command.contains("--no-onboard"));
+        assert!(command.contains("--no-prompt"));
+        assert!(!command.contains("install-cli.sh"));
     }
 
     #[test]

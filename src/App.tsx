@@ -590,28 +590,186 @@ function isWarningOnlyDetailLine(line: string): boolean {
     || normalized.includes("running in non-interactive mode because stdin is not a tty");
 }
 
+function unwrapWrapperDetailLine(line: string): string {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  const match = trimmed.match(/^(?:(?:[\w./() -]+)\s+)?(stdout|stderr|exit_code):\s*(.*)$/i);
+  if (!match) {
+    return trimmed;
+  }
+
+  const [, kind, remainder = ""] = match;
+  const normalizedKind = kind.toLowerCase();
+  const normalizedRemainder = remainder.trim();
+  if (normalizedKind === "exit_code") {
+    return /^\d+$/.test(normalizedRemainder) ? "" : normalizedRemainder;
+  }
+  return normalizedRemainder;
+}
+
+function extractStructuredDetailValues(value: unknown, depth = 0): string[] {
+  if (depth > 3) {
+    return [];
+  }
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return [String(value)];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => extractStructuredDetailValues(item, depth + 1));
+  }
+  if (!isRecord(value)) {
+    return [];
+  }
+
+  return [
+    "fatal",
+    "error",
+    "detail",
+    "details",
+    "message",
+    "reason",
+    "stderr",
+    "stdout",
+    "cause",
+  ].flatMap((key) => extractStructuredDetailValues(value[key], depth + 1));
+}
+
+function parseJsonDetailLines(line: string): string[] {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed);
+    const seen = new Set<string>();
+    return extractStructuredDetailValues(parsed)
+      .flatMap((value) => value.split("\n"))
+      .map((value) => unwrapWrapperDetailLine(value))
+      .map((value) => value.trim())
+      .filter((value) => {
+        if (!value || seen.has(value)) {
+          return false;
+        }
+        seen.add(value);
+        return true;
+      });
+  } catch {
+    return [];
+  }
+}
+
+function detailCandidateLines(value: string): string[] {
+  return value
+    .split("\n")
+    .flatMap((rawLine) => {
+      const line = rawLine.trim();
+      if (!line) {
+        return [];
+      }
+
+      const jsonLines = parseJsonDetailLines(line);
+      if (jsonLines.length > 0) {
+        return jsonLines;
+      }
+
+      const unwrapped = unwrapWrapperDetailLine(line);
+      return unwrapped ? [unwrapped] : [];
+    });
+}
+
 function isNonActionableDetailLine(line: string): boolean {
-  const normalized = line.trim().toLowerCase();
+  const normalized = unwrapWrapperDetailLine(line).trim().toLowerCase();
   if (!normalized) {
     return true;
   }
 
   return isWarningOnlyDetailLine(line)
+    || normalized.startsWith("==>")
     || normalized.startsWith("usage:")
     || normalized.startsWith("options:")
     || normalized.startsWith("🦞 openclaw")
+    || normalized === "stdout:"
+    || normalized === "stderr:"
+    || normalized === "exit_code:"
     || normalized.endsWith(" stdout:")
     || normalized.endsWith(" stderr:")
-    || normalized.includes(" exit_code:");
+    || normalized.endsWith(" exit_code:");
+}
+
+function detailLineScore(line: string): number {
+  const normalized = unwrapWrapperDetailLine(line).trim().toLowerCase();
+  if (!normalized || isNonActionableDetailLine(normalized)) {
+    return -1;
+  }
+
+  if (normalized.startsWith("fatal:") || normalized.startsWith("error:") || normalized.startsWith("err:")) {
+    return 5;
+  }
+
+  if (
+    normalized.includes("permission denied")
+    || normalized.includes("homebrew is not installed")
+    || normalized.includes("failed to")
+    || normalized.includes("unable to")
+    || normalized.includes("cannot ")
+    || normalized.endsWith(" cannot")
+    || normalized.includes("timed out")
+    || normalized.includes("no such file")
+    || normalized.includes("not found")
+    || normalized.includes("invalid")
+    || normalized.includes("denied")
+  ) {
+    return 4;
+  }
+
+  if (
+    normalized.includes("fatal")
+    || normalized.includes("error")
+    || normalized.includes("exception")
+    || normalized.includes("panic")
+    || normalized.includes("failed")
+  ) {
+    return 3;
+  }
+
+  return 1;
 }
 
 function firstActionableDetailLine(value: string): string {
-  const lines = value
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
+  const lines = detailCandidateLines(value);
+  let bestLine = "";
+  let bestScore = -1;
 
-  return lines.find((line) => !isNonActionableDetailLine(line)) ?? lines[0] ?? "";
+  for (const line of lines) {
+    const score = detailLineScore(line);
+    if (score > bestScore) {
+      bestLine = line;
+      bestScore = score;
+    }
+  }
+
+  return bestLine || lines.find((line) => !isNonActionableDetailLine(line)) || "";
+}
+
+function bestActionableDetailLine(...values: string[]): string {
+  let bestLine = "";
+  let bestScore = -1;
+
+  for (const value of values) {
+    for (const line of detailCandidateLines(value)) {
+      const score = detailLineScore(line);
+      if (score > bestScore) {
+        bestLine = line;
+        bestScore = score;
+      }
+    }
+  }
+
+  return bestLine || values.map((value) => firstActionableDetailLine(value)).find(Boolean) || "";
 }
 
 function isTransientGatewayDetail(value: string): boolean {
@@ -840,19 +998,21 @@ function parseLaunchResponse(response: CommandResponse): LaunchSnapshot {
   const firstIssue = issues.find((issue) => isRecord(issue));
   const rpcError = rpc ? firstLine(toText(rpc.error)) : "";
   const serviceIssue = firstIssue ? firstLine(toText(firstIssue.message)) : "";
+  const summary = firstNonEmpty(
+    appReady === false ? rpcError : "",
+    serviceReady === false ? serviceIssue : "",
+    firstLine(response.stderr),
+    firstLine(response.stdout),
+    response.success ? "" : firstLine(response.message),
+  );
+  const shouldHideTransientSummary = serviceReady === true && localReady === true && isTransientGatewayDetail(summary);
 
   return {
     checked: true,
     serviceReady,
     localReady,
     appReady,
-    summary: firstNonEmpty(
-      appReady === false ? rpcError : "",
-      serviceReady === false ? serviceIssue : "",
-      firstLine(response.stderr),
-      firstLine(response.stdout),
-      response.success ? "" : firstLine(response.message),
-    ),
+    summary: shouldHideTransientSummary ? "" : summary,
     rawStdout: response.stdout,
     rawStderr: response.stderr,
   };
@@ -991,11 +1151,7 @@ function nextBlockingStep(
 }
 
 function commandErrorDetail(response: CommandResponse): string {
-  return firstNonEmpty(
-    firstActionableDetailLine(response.stderr),
-    firstActionableDetailLine(response.stdout),
-    firstActionableDetailLine(response.message),
-  );
+  return bestActionableDetailLine(response.stderr, response.stdout, response.message);
 }
 
 function launchStatusValue(copy: Copy, value: boolean | null): string {
@@ -1061,18 +1217,8 @@ function TechnicalDetails({ title, stdout, stderr }: { title: string; stdout: st
   );
 }
 
-function StageSkeleton() {
-  return (
-    <div className="skeleton-stack" aria-hidden="true">
-      <div className="skeleton-line skeleton-line-short" />
-      <div className="skeleton-line skeleton-line-title" />
-      <div className="skeleton-line" />
-      <div className="skeleton-list">
-        <div className="skeleton-card" />
-        <div className="skeleton-card" />
-      </div>
-    </div>
-  );
+function buttonClassName(...tokens: Array<string | false | null | undefined>) {
+  return tokens.filter(Boolean).join(" ");
 }
 
 export default function App() {
@@ -1095,6 +1241,10 @@ export default function App() {
   const currentMeta = copy.steps[currentStep];
   const currentStepIndex = STEP_ORDER.indexOf(currentStep);
   const progressPercent = `${((currentStepIndex + 1) / STEP_ORDER.length) * 100}%`;
+  const installStepBusy = busyAction === "check" || busyAction === "install";
+  const modelStepBusy = busyAction === "check" || busyAction === "connect";
+  const launchStepBusy = busyAction === "check" || busyAction === "launch";
+  const successStepBusy = busyAction === "check" || busyAction === "enter";
   const connectedServiceLabel = aiConnection.connected
     ? serviceLabelForProvider(locale, aiConnection.providerName, aiConnection.baseUrl)
     : copy.states.waiting;
@@ -1313,10 +1463,6 @@ export default function App() {
   const canSkipSavingAi = aiConnection.connected && !serviceForm.apiKey.trim();
 
   function renderStage() {
-    if (bootstrapping) {
-      return <StageSkeleton />;
-    }
-
     if (currentStep === "welcome") {
       return (
         <>
@@ -1371,22 +1517,22 @@ export default function App() {
           <TechnicalDetails title={copy.technicalDetails} stdout={installState.rawStdout} stderr={installState.rawStderr} />
 
           <div className="action-row">
-            <button type="button" className="button button-secondary" onClick={handleBack}>
+            <button type="button" className="button button-secondary" onClick={handleBack} disabled={installStepBusy}>
               {copy.actions.back}
             </button>
             <button
               type="button"
-              className="button button-secondary"
+              className={buttonClassName("button button-secondary", busyAction === "check" && "button-loading")}
               onClick={() => void syncState(false)}
-              disabled={busyAction === "check"}
+              disabled={installStepBusy}
             >
               {busyAction === "check" ? copy.actions.checking : copy.actions.checkAgain}
             </button>
             <button
               type="button"
-              className="button button-primary button-large"
+              className={buttonClassName("button button-primary button-large", busyAction === "install" && "button-loading")}
               onClick={installState.installed ? () => setCurrentStep("model") : () => void handleInstall()}
-              disabled={busyAction === "install"}
+              disabled={installStepBusy}
             >
               {installState.installed ? copy.actions.continue : busyAction === "install" ? copy.actions.installing : copy.actions.install}
             </button>
@@ -1416,6 +1562,7 @@ export default function App() {
                 type="button"
                 className={`choice-card ${selectedPreset === presetId ? "choice-card-active" : ""}`}
                 onClick={() => handlePresetSelect(presetId)}
+                disabled={modelStepBusy}
               >
                 <strong>{preset.label[locale]}</strong>
                 <span>{preset.hint[locale]}</span>
@@ -1440,6 +1587,7 @@ export default function App() {
                 type="button"
                 className="button button-ghost"
                 onClick={() => setShowAdvancedFields((current) => !current)}
+                disabled={modelStepBusy}
               >
                 {showAdvancedFields ? copy.actions.hideAdvanced : copy.actions.showAdvanced}
               </button>
@@ -1496,22 +1644,22 @@ export default function App() {
           <TechnicalDetails title={copy.technicalDetails} stdout={aiConnection.rawStdout} stderr={aiConnection.rawStderr} />
 
           <div className="action-row">
-            <button type="button" className="button button-secondary" onClick={handleBack}>
+            <button type="button" className="button button-secondary" onClick={handleBack} disabled={modelStepBusy}>
               {copy.actions.back}
             </button>
             <button
               type="button"
-              className="button button-secondary"
+              className={buttonClassName("button button-secondary", busyAction === "check" && "button-loading")}
               onClick={() => void syncState(false)}
-              disabled={busyAction === "check"}
+              disabled={modelStepBusy}
             >
               {busyAction === "check" ? copy.actions.checking : copy.actions.checkAgain}
             </button>
             <button
               type="button"
-              className="button button-primary button-large"
+              className={buttonClassName("button button-primary button-large", busyAction === "connect" && "button-loading")}
               onClick={canSkipSavingAi ? () => setCurrentStep("launch") : () => void handleConnectAi()}
-              disabled={busyAction === "connect" || !installState.installed}
+              disabled={modelStepBusy || !installState.installed}
             >
               {canSkipSavingAi ? copy.actions.continue : busyAction === "connect" ? copy.actions.connecting : copy.actions.connect}
             </button>
@@ -1551,22 +1699,22 @@ export default function App() {
           <TechnicalDetails title={copy.technicalDetails} stdout={launchState.rawStdout} stderr={launchState.rawStderr} />
 
           <div className="action-row">
-            <button type="button" className="button button-secondary" onClick={handleBack}>
+            <button type="button" className="button button-secondary" onClick={handleBack} disabled={launchStepBusy}>
               {copy.actions.back}
             </button>
             <button
               type="button"
-              className="button button-secondary"
+              className={buttonClassName("button button-secondary", busyAction === "check" && "button-loading")}
               onClick={() => void syncState(false)}
-              disabled={busyAction === "check"}
+              disabled={launchStepBusy}
             >
               {busyAction === "check" ? copy.actions.checking : copy.actions.checkAgain}
             </button>
             <button
               type="button"
-              className="button button-primary button-large"
+              className={buttonClassName("button button-primary button-large", busyAction === "launch" && "button-loading")}
               onClick={launchReady ? () => setCurrentStep("success") : () => void handleLaunch()}
-              disabled={busyAction === "launch" || !installState.installed || !aiConnection.connected}
+              disabled={launchStepBusy || !installState.installed || !aiConnection.connected}
             >
               {launchReady ? copy.actions.continue : busyAction === "launch" ? copy.actions.launching : copy.actions.launch}
             </button>
