@@ -375,16 +375,27 @@ const I18N = {
       cards: {
         service: "OpenClaw 服务",
         local: "本地网关",
-        app: "桌面连接",
+        app: "应用连接",
+      },
+      activity: {
+        checkingTitle: "正在重新检查当前状态",
+        checkingBody: "正在读取 OpenClaw 服务、本地网关和应用连接状态。",
+        launchingTitle: "正在完成首次启动",
+        launchingBody: "OpenClaw 正在写入最终配置、拉起本地网关并验证应用连接，请稍候。",
+        steps: {
+          validate: "检查当前配置",
+          start: "启动 OpenClaw 与本地网关",
+          confirm: "确认应用连接",
+        },
       },
       readyTitle: "当前已经可以继续",
       readyBody: "启动与首次初始化看起来都已完成。",
       pendingTitle: "还需要完成最后的启动检查",
       pendingBody: "如果你还没执行过这一步，点击按钮后应用会尝试完成启动和首次初始化。",
-      readySummary: "OpenClaw 服务、本地网关和桌面连接都已经就绪。",
+      readySummary: "OpenClaw 服务、本地网关和应用连接都已经就绪。",
       serviceHint: "还没检测到 OpenClaw 服务处于可用状态，请先执行这一步来安装或拉起服务。",
       localHint: "服务可能已存在，但本地网关还没有确认监听成功。",
-      appHint: "本地网关看起来已经起来了，但桌面端还没有完成最终连接；请查看技术详情里的具体错误。",
+      appHint: "本地网关看起来已经起来了，但应用和它还没完成最后握手；请查看技术详情里的具体错误。",
     },
     success: {
       title: "OpenClaw 已可以开始使用",
@@ -507,16 +518,27 @@ const I18N = {
       cards: {
         service: "OpenClaw service",
         local: "Local gateway",
-        app: "Desktop connection",
+        app: "App connection",
+      },
+      activity: {
+        checkingTitle: "Re-checking the current status",
+        checkingBody: "Reading the OpenClaw service, local gateway, and app connection state.",
+        launchingTitle: "Finishing first startup",
+        launchingBody: "OpenClaw is writing the final config, starting the local gateway, and verifying the app connection.",
+        steps: {
+          validate: "Check the current config",
+          start: "Start OpenClaw and the local gateway",
+          confirm: "Confirm the app connection",
+        },
       },
       readyTitle: "You can continue now",
       readyBody: "Startup and first-time initialization both look complete.",
       pendingTitle: "One final startup check still needs attention",
       pendingBody: "If you have not run this step yet, the button below attempts startup and first-time initialization for you.",
-      readySummary: "The OpenClaw service, local gateway, and desktop connection all look ready.",
+      readySummary: "The OpenClaw service, local gateway, and app connection all look ready.",
       serviceHint: "The OpenClaw service does not look usable yet, so this step still needs to install or start it.",
       localHint: "The service may exist, but the local gateway is not confirmed as listening yet.",
-      appHint: "The local gateway appears to be up, but the desktop app has not finished the final connection; check Technical details for the concrete error.",
+      appHint: "The local gateway appears to be up, but the app has not finished the final handshake; check Technical details for the concrete error.",
     },
     success: {
       title: "OpenClaw is ready to use",
@@ -772,6 +794,73 @@ function bestActionableDetailLine(...values: string[]): string {
   return bestLine || values.map((value) => firstActionableDetailLine(value)).find(Boolean) || "";
 }
 
+function isLikelyLaunchConsequenceDetail(line: string): boolean {
+  const normalized = unwrapWrapperDetailLine(line).trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  if (normalized.includes("agents.defaults.model.primary") || normalized.includes("default model")) {
+    return false;
+  }
+
+  return [
+    "rpc disconnected",
+    "rpc failed",
+    "not connected",
+    "disconnected",
+    "connection refused",
+    "connection reset",
+    "gateway url override requires explicit credentials",
+    "desktop connection",
+    "app connection",
+  ].some((token) => normalized.includes(token));
+}
+
+function launchDetailScore(line: string): number {
+  let score = detailLineScore(line);
+  if (score < 0) {
+    return score;
+  }
+
+  const normalized = unwrapWrapperDetailLine(line).trim().toLowerCase();
+  if (normalized.includes("agents.defaults.model.primary")) {
+    score += 3;
+  } else if (normalized.includes("default model")) {
+    score += 2;
+  }
+
+  if (normalized.includes("save the ai service again") || normalized.includes("重新保存")) {
+    score += 1;
+  }
+
+  if (isLikelyLaunchConsequenceDetail(line)) {
+    score -= 2;
+  }
+
+  return score;
+}
+
+function bestLaunchDetailLine(...values: string[]): string {
+  let bestLine = "";
+  let bestScore = -1;
+
+  for (const value of values) {
+    const lines = detailCandidateLines(value);
+    const candidates = lines.length > 0 ? lines : value.trim() ? [value.trim()] : [];
+
+    for (const line of candidates) {
+      const score = launchDetailScore(line);
+      if (score > bestScore) {
+        bestLine = line;
+        bestScore = score;
+      }
+    }
+  }
+
+  return bestLine || bestActionableDetailLine(...values);
+}
+
 function isTransientGatewayDetail(value: string): boolean {
   const normalized = value.trim().toLowerCase();
   if (!normalized) {
@@ -998,12 +1087,12 @@ function parseLaunchResponse(response: CommandResponse): LaunchSnapshot {
   const firstIssue = issues.find((issue) => isRecord(issue));
   const rpcError = rpc ? firstLine(toText(rpc.error)) : "";
   const serviceIssue = firstIssue ? firstLine(toText(firstIssue.message)) : "";
-  const summary = firstNonEmpty(
-    appReady === false ? rpcError : "",
+  const summary = bestLaunchDetailLine(
     serviceReady === false ? serviceIssue : "",
-    firstLine(response.stderr),
-    firstLine(response.stdout),
-    response.success ? "" : firstLine(response.message),
+    response.stderr,
+    response.stdout,
+    response.success ? "" : response.message,
+    appReady === false ? rpcError : "",
   );
   const shouldHideTransientSummary = serviceReady === true && localReady === true && isTransientGatewayDetail(summary);
 
@@ -1194,6 +1283,23 @@ function launchSummaryText(snapshot: LaunchSnapshot, copy: Copy): string {
   return firstNonEmpty(snapshot.summary, launchGuidance(snapshot, copy));
 }
 
+function launchActivityState(copy: Copy, busyAction: BusyAction) {
+  if (busyAction !== "check" && busyAction !== "launch") {
+    return null;
+  }
+
+  return {
+    title: busyAction === "check" ? copy.launch.activity.checkingTitle : copy.launch.activity.launchingTitle,
+    body: busyAction === "check" ? copy.launch.activity.checkingBody : copy.launch.activity.launchingBody,
+    activeStep: busyAction === "check" ? 0 : 1,
+    steps: [
+      copy.launch.activity.steps.validate,
+      copy.launch.activity.steps.start,
+      copy.launch.activity.steps.confirm,
+    ],
+  };
+}
+
 function StatusRow({ label, value, tone }: { label: string; value: string; tone: RowTone }) {
   return (
     <div className={`status-row status-row-${tone}`}>
@@ -1245,6 +1351,7 @@ export default function App() {
   const modelStepBusy = busyAction === "check" || busyAction === "connect";
   const launchStepBusy = busyAction === "check" || busyAction === "launch";
   const successStepBusy = busyAction === "check" || busyAction === "enter";
+  const launchActivity = currentStep === "launch" ? launchActivityState(copy, busyAction) : null;
   const connectedServiceLabel = aiConnection.connected
     ? serviceLabelForProvider(locale, aiConnection.providerName, aiConnection.baseUrl)
     : copy.states.waiting;
@@ -1425,9 +1532,17 @@ export default function App() {
 
   async function handleLaunch() {
     setBusyAction("launch");
+    setNotice({ kind: "info", text: copy.launch.activity.launchingBody });
     const response = await launchOpenclaw();
     const snapshots = await syncState(true, { announce: false });
-    const detail = commandErrorDetail(response);
+    const detail = bestLaunchDetailLine(
+      response.message,
+      response.stderr,
+      response.stdout,
+      snapshots.launch.summary,
+      snapshots.launch.rawStderr,
+      snapshots.launch.rawStdout,
+    );
     const launchDetail = launchSummaryText(snapshots.launch, copy);
 
     if (isLaunchReady(snapshots.launch)) {
@@ -1444,7 +1559,13 @@ export default function App() {
       return;
     }
 
-    setNotice({ kind: "error", text: mergeNoticeText(copy.notices.launchFailed, detail, launchDetail) });
+    const secondaryDetail = launchDetail !== detail && !isLikelyLaunchConsequenceDetail(launchDetail)
+      ? launchDetail
+      : "";
+    setNotice({
+      kind: "error",
+      text: mergeNoticeText(copy.notices.launchFailed, detail || launchDetail, secondaryDetail),
+    });
   }
 
   async function handleStartUsing() {
@@ -1677,6 +1798,34 @@ export default function App() {
           </div>
 
           <p className="stage-note">{launchSummaryText(launchState, copy)}</p>
+
+          {launchActivity ? (
+            <div className="launch-activity" role="status" aria-live="polite" aria-busy="true">
+              <div className="launch-activity-head">
+                <span className="launch-activity-dot" />
+                <div className="launch-activity-copy">
+                  <strong>{launchActivity.title}</strong>
+                  <p>{launchActivity.body}</p>
+                </div>
+              </div>
+
+              <div className="launch-activity-steps">
+                {launchActivity.steps.map((step, index) => (
+                  <div
+                    key={step}
+                    className={buttonClassName(
+                      "launch-activity-step",
+                      index < launchActivity.activeStep && "launch-activity-step-done",
+                      index === launchActivity.activeStep && "launch-activity-step-active",
+                    )}
+                  >
+                    <span className="launch-activity-step-index">{index + 1}</span>
+                    <span>{step}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
 
           <div className="status-list">
             <StatusRow

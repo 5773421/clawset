@@ -1108,6 +1108,282 @@ fn openclaw_provider_models_value(default_model: &str, api: Option<&str>) -> Val
     Value::Array(vec![Value::Object(model)])
 }
 
+fn openclaw_model_reference(provider_name: &str, model_id: &str) -> Result<String, String> {
+    let provider_name = provider_name.trim();
+    if provider_name.is_empty() {
+        return Err("provider_name cannot be empty".to_string());
+    }
+
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return Err("default_model cannot be empty".to_string());
+    }
+
+    Ok(format!("{provider_name}/{model_id}"))
+}
+
+fn extract_openclaw_model_id(value: &Value) -> Option<String> {
+    match value {
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Value::Object(object) => ["id", "default_model", "name"].iter().find_map(|key| {
+            object
+                .get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        }),
+        _ => None,
+    }
+}
+
+fn configured_openclaw_model_references(config: &Value) -> Result<Vec<String>, String> {
+    let Some(root) = config.as_object() else {
+        return Err("config root must be a JSON object".to_string());
+    };
+    let Some(models_value) = root.get("models") else {
+        return Ok(Vec::new());
+    };
+    let Some(models) = models_value.as_object() else {
+        return Err("models must be a JSON object".to_string());
+    };
+    let Some(providers_value) = models.get("providers") else {
+        return Ok(Vec::new());
+    };
+    let Some(providers) = providers_value.as_object() else {
+        return Err("models.providers must be a JSON object".to_string());
+    };
+
+    let mut model_references = Vec::new();
+    let mut seen = HashSet::new();
+
+    for (provider_name, provider_value) in providers {
+        let Some(provider) = provider_value.as_object() else {
+            continue;
+        };
+        let Some(provider_models_value) = provider.get("models") else {
+            continue;
+        };
+
+        let model_ids: Vec<String> = match provider_models_value {
+            Value::Array(items) => items.iter().filter_map(extract_openclaw_model_id).collect(),
+            _ => extract_openclaw_model_id(provider_models_value)
+                .into_iter()
+                .collect(),
+        };
+
+        for model_id in model_ids {
+            let model_reference = openclaw_model_reference(provider_name, &model_id)?;
+            if seen.insert(model_reference.clone()) {
+                model_references.push(model_reference);
+            }
+        }
+    }
+
+    Ok(model_references)
+}
+
+fn current_openclaw_primary_model_reference(config: &Value) -> Result<Option<String>, String> {
+    let Some(root) = config.as_object() else {
+        return Err("config root must be a JSON object".to_string());
+    };
+    let Some(agents_value) = root.get("agents") else {
+        return Ok(None);
+    };
+    let Some(agents) = agents_value.as_object() else {
+        return Err("agents must be a JSON object".to_string());
+    };
+    let Some(defaults_value) = agents.get("defaults") else {
+        return Ok(None);
+    };
+    let Some(defaults) = defaults_value.as_object() else {
+        return Err("agents.defaults must be a JSON object".to_string());
+    };
+    let Some(model_value) = defaults.get("model") else {
+        return Ok(None);
+    };
+
+    let model_reference = match model_value {
+        Value::String(raw) => Some(raw.as_str()),
+        Value::Object(object) => object.get("primary").and_then(Value::as_str),
+        _ => None,
+    }
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .map(ToOwned::to_owned);
+
+    Ok(model_reference)
+}
+
+fn ensure_openclaw_primary_model_reference(
+    config: &mut Value,
+    model_reference: &str,
+) -> Result<bool, String> {
+    let model_reference = model_reference.trim();
+    if model_reference.is_empty() {
+        return Err("model reference cannot be empty".to_string());
+    }
+
+    let Some(root) = config.as_object_mut() else {
+        return Err("config root must be a JSON object".to_string());
+    };
+
+    let agents_value = root
+        .entry("agents".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(agents) = agents_value.as_object_mut() else {
+        return Err("agents must be a JSON object".to_string());
+    };
+
+    let defaults_value = agents
+        .entry("defaults".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(defaults) = defaults_value.as_object_mut() else {
+        return Err("agents.defaults must be a JSON object".to_string());
+    };
+
+    let mut changed = false;
+    match defaults.get_mut("model") {
+        Some(Value::Object(model)) => {
+            let current_primary = model
+                .get("primary")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            if current_primary != model_reference {
+                model.insert(
+                    "primary".to_string(),
+                    Value::String(model_reference.to_string()),
+                );
+                changed = true;
+            }
+        }
+        Some(model_value) => {
+            // Migrate legacy/non-object shapes to the current `{ primary: ... }` form.
+            *model_value = serde_json::json!({ "primary": model_reference });
+            changed = true;
+        }
+        None => {
+            defaults.insert(
+                "model".to_string(),
+                serde_json::json!({ "primary": model_reference }),
+            );
+            changed = true;
+        }
+    }
+
+    let models_value = defaults
+        .entry("models".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(models) = models_value.as_object_mut() else {
+        return Err("agents.defaults.models must be a JSON object".to_string());
+    };
+    if !models.contains_key(model_reference) {
+        models.insert(model_reference.to_string(), Value::Object(Map::new()));
+        changed = true;
+    }
+
+    Ok(changed)
+}
+
+fn ensure_openclaw_gateway_local_mode(config: &mut Value) -> Result<bool, String> {
+    let Some(root) = config.as_object_mut() else {
+        return Err("config root must be a JSON object".to_string());
+    };
+
+    let gateway_value = root
+        .entry("gateway".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(gateway) = gateway_value.as_object_mut() else {
+        return Err("gateway must be a JSON object".to_string());
+    };
+
+    let current_mode = gateway
+        .get("mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if current_mode == "local" {
+        return Ok(false);
+    }
+
+    gateway.insert("mode".to_string(), Value::String("local".to_string()));
+    Ok(true)
+}
+
+fn ensure_saved_provider_default_model_selection_in_config(
+    config: &mut Value,
+    provider_name: &str,
+    default_model: &str,
+) -> Result<(String, bool), String> {
+    let model_reference = openclaw_model_reference(provider_name, default_model)?;
+    let model_changed = ensure_openclaw_primary_model_reference(config, &model_reference)?;
+    let gateway_changed = ensure_openclaw_gateway_local_mode(config)?;
+    let changed = model_changed || gateway_changed;
+    Ok((model_reference, changed))
+}
+
+fn persist_saved_provider_default_model_selection(
+    provider_name: &str,
+    default_model: &str,
+) -> Result<(), String> {
+    let mut config = read_openclaw_config_value()?;
+    let (_, changed) = ensure_saved_provider_default_model_selection_in_config(
+        &mut config,
+        provider_name,
+        default_model,
+    )?;
+    if changed {
+        write_openclaw_config_value(&config)?;
+    }
+
+    Ok(())
+}
+
+fn missing_default_model_selection_error() -> String {
+    let config_path = openclaw_config_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "~/.openclaw/openclaw.json".to_string());
+
+    format!(
+        "No default model is configured yet. Missing agents.defaults.model.primary in {config_path}. Save the AI service again to finish setup."
+    )
+}
+
+fn ensure_launch_default_model_selection_in_config(
+    config: &mut Value,
+) -> Result<Option<String>, String> {
+    if current_openclaw_primary_model_reference(config)?.is_some() {
+        return Ok(None);
+    }
+
+    let configured_models = configured_openclaw_model_references(config)?;
+    if configured_models.len() != 1 {
+        return Err(missing_default_model_selection_error());
+    }
+
+    let model_reference = configured_models[0].clone();
+    ensure_openclaw_primary_model_reference(config, &model_reference)?;
+    Ok(Some(model_reference))
+}
+
+fn ensure_launch_default_model_selection() -> Result<Option<String>, String> {
+    let mut config = read_openclaw_config_value()?;
+    let recovered_model = ensure_launch_default_model_selection_in_config(&mut config)?;
+    if recovered_model.is_some() {
+        write_openclaw_config_value(&config)?;
+    }
+
+    Ok(recovered_model)
+}
+
 fn migrate_openclaw_provider_models_values(config: &mut Value) -> Result<bool, String> {
     let Some(root) = config.as_object_mut() else {
         return Err("config root must be a JSON object".to_string());
@@ -1777,6 +2053,12 @@ fn write_openclaw_provider(
         }
     };
 
+    if let Err(error) =
+        persist_saved_provider_default_model_selection(&provider_name, &default_model)
+    {
+        return CommandResponse::failure("Failed to write OpenClaw provider", error);
+    }
+
     CommandResponse {
         success: true,
         stdout: get_exec.stdout,
@@ -1795,6 +2077,17 @@ fn launch_openclaw() -> CommandResponse {
 
     let mut stdout_sections = Vec::new();
     let mut stderr_sections = Vec::new();
+
+    match ensure_launch_default_model_selection() {
+        Ok(Some(model_reference)) => append_output_section(
+            &mut stdout_sections,
+            "config preflight",
+            format!("Recovered missing agents.defaults.model.primary with {model_reference}.")
+                .as_str(),
+        ),
+        Ok(None) => {}
+        Err(error) => return CommandResponse::failure("OpenClaw launch failed", error),
+    }
 
     let validate_exec = run_openclaw_command(&["config", "validate"]);
     append_exec_output(
@@ -2487,6 +2780,125 @@ openclaw is /opt/homebrew/bin/openclaw
                 }
             ])
         );
+    }
+
+    #[test]
+    fn saved_provider_write_also_sets_default_model_selection() {
+        let mut config = serde_json::json!({
+            "models": {
+                "providers": {
+                    "openai": {
+                        "models": [
+                            { "id": "gpt-4o-mini", "name": "gpt-4o-mini" }
+                        ]
+                    }
+                }
+            }
+        });
+
+        let (model_reference, changed) = ensure_saved_provider_default_model_selection_in_config(
+            &mut config,
+            "openai",
+            "gpt-4o-mini",
+        )
+        .expect("set default model");
+
+        assert!(changed);
+        assert_eq!(model_reference, "openai/gpt-4o-mini");
+        assert_eq!(
+            config["agents"]["defaults"]["model"]["primary"],
+            Value::String("openai/gpt-4o-mini".to_string())
+        );
+        assert_eq!(
+            config["agents"]["defaults"]["models"]["openai/gpt-4o-mini"],
+            Value::Object(Map::new())
+        );
+        assert_eq!(
+            config["gateway"]["mode"],
+            Value::String("local".to_string())
+        );
+    }
+
+    #[test]
+    fn saved_provider_write_preserves_existing_local_gateway_mode_without_extra_change() {
+        let mut config = serde_json::json!({
+            "gateway": {
+                "mode": "local"
+            },
+            "agents": {
+                "defaults": {
+                    "model": {
+                        "primary": "openai/gpt-4o-mini"
+                    },
+                    "models": {
+                        "openai/gpt-4o-mini": {}
+                    }
+                }
+            }
+        });
+
+        let (model_reference, changed) = ensure_saved_provider_default_model_selection_in_config(
+            &mut config,
+            "openai",
+            "gpt-4o-mini",
+        )
+        .expect("preserve gateway mode");
+
+        assert_eq!(model_reference, "openai/gpt-4o-mini");
+        assert!(!changed);
+        assert_eq!(
+            config["gateway"]["mode"],
+            Value::String("local".to_string())
+        );
+    }
+
+    #[test]
+    fn launch_preflight_recovers_single_configured_model_reference() {
+        let mut config = serde_json::json!({
+            "models": {
+                "providers": {
+                    "openai": {
+                        "models": [
+                            { "id": "gpt-4o-mini", "name": "gpt-4o-mini" }
+                        ]
+                    }
+                }
+            }
+        });
+
+        let recovered = ensure_launch_default_model_selection_in_config(&mut config)
+            .expect("recover default model");
+
+        assert_eq!(recovered.as_deref(), Some("openai/gpt-4o-mini"));
+        assert_eq!(
+            config["agents"]["defaults"]["model"]["primary"],
+            Value::String("openai/gpt-4o-mini".to_string())
+        );
+    }
+
+    #[test]
+    fn launch_preflight_errors_when_default_model_is_missing_and_ambiguous() {
+        let mut config = serde_json::json!({
+            "models": {
+                "providers": {
+                    "openai": {
+                        "models": [
+                            { "id": "gpt-4o-mini", "name": "gpt-4o-mini" }
+                        ]
+                    },
+                    "anthropic": {
+                        "models": [
+                            { "id": "claude-3-7-sonnet", "name": "claude-3-7-sonnet" }
+                        ]
+                    }
+                }
+            }
+        });
+
+        let error = ensure_launch_default_model_selection_in_config(&mut config)
+            .expect_err("missing default model should fail");
+
+        assert!(error.contains("agents.defaults.model.primary"));
     }
 }
 
