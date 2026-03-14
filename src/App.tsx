@@ -127,7 +127,7 @@ const DEFAULT_FORM: ServiceFormState = {
   providerName: "openai",
   baseUrl: "https://api.openai.com/v1",
   api: "openai-completions",
-  defaultModel: "gpt-4o-mini",
+  defaultModel: "gpt-5.4",
   apiKey: "",
 };
 
@@ -136,7 +136,7 @@ const SERVICE_PRESETS: Record<ServicePresetId, ServicePreset> = {
     providerName: "openai",
     baseUrl: "https://api.openai.com/v1",
     api: "openai-completions",
-    defaultModel: "gpt-4o-mini",
+    defaultModel: "gpt-5.4",
     label: { "zh-CN": "OpenAI", "en-US": "OpenAI" },
     hint: {
       "zh-CN": "最直接，通常只要填访问密钥。",
@@ -147,7 +147,7 @@ const SERVICE_PRESETS: Record<ServicePresetId, ServicePreset> = {
     providerName: "kimi",
     baseUrl: "https://api.moonshot.cn/v1",
     api: "openai-completions",
-    defaultModel: "moonshot-v1-8k",
+    defaultModel: "kimi-k2.5",
     label: { "zh-CN": "Kimi", "en-US": "Kimi" },
     hint: {
       "zh-CN": "适合 Kimi / Moonshot 用户。",
@@ -158,7 +158,7 @@ const SERVICE_PRESETS: Record<ServicePresetId, ServicePreset> = {
     providerName: "glm",
     baseUrl: "https://open.bigmodel.cn/api/paas/v4",
     api: "openai-completions",
-    defaultModel: "glm-4-flash",
+    defaultModel: "glm-5",
     label: { "zh-CN": "GLM", "en-US": "GLM" },
     hint: {
       "zh-CN": "适合 GLM 用户。",
@@ -169,7 +169,7 @@ const SERVICE_PRESETS: Record<ServicePresetId, ServicePreset> = {
     providerName: "openrouter",
     baseUrl: "https://openrouter.ai/api/v1",
     api: "openai-completions",
-    defaultModel: "openai/gpt-4o-mini",
+    defaultModel: "anthropic/claude-sonnet-4-5",
     label: { "zh-CN": "OpenRouter", "en-US": "OpenRouter" },
     hint: {
       "zh-CN": "适合想先试多个模型服务的人。",
@@ -1703,6 +1703,15 @@ export default function App() {
               <small>{copy.model.accessKeyHint}</small>
             </label>
 
+            <label className="field">
+              <span>{copy.model.modelLabel}</span>
+              <input
+                type="text"
+                value={serviceForm.defaultModel}
+                onChange={(event) => setServiceForm((current) => ({ ...current, defaultModel: event.target.value }))}
+              />
+            </label>
+
             <div className="inline-bar">
               <button
                 type="button"
@@ -1750,14 +1759,6 @@ export default function App() {
                     <small>{copy.model.customApiHint}</small>
                   </label>
                 ) : null}
-                <label className="field">
-                  <span>{copy.model.modelLabel}</span>
-                  <input
-                    type="text"
-                    value={serviceForm.defaultModel}
-                    onChange={(event) => setServiceForm((current) => ({ ...current, defaultModel: event.target.value }))}
-                  />
-                </label>
               </div>
             ) : null}
           </div>
