@@ -2069,8 +2069,7 @@ fn write_openclaw_provider(
     }
 }
 
-#[tauri::command]
-fn launch_openclaw() -> CommandResponse {
+fn do_launch_openclaw() -> CommandResponse {
     if let Err(error) = migrate_openclaw_config_file_for_cli() {
         return CommandResponse::failure("OpenClaw launch failed", error);
     }
@@ -2267,6 +2266,239 @@ fn launch_openclaw() -> CommandResponse {
         message,
         parsed_json: final_status_json,
     }
+}
+
+#[tauri::command]
+fn launch_openclaw() -> CommandResponse {
+    do_launch_openclaw()
+}
+
+#[tauri::command]
+fn stop_openclaw() -> CommandResponse {
+    let exec = run_openclaw_command(&["gateway", "stop", "--json"]);
+    let success = exec.exit_code == 0;
+    let message = if success {
+        "OpenClaw gateway stopped".to_string()
+    } else {
+        pick_actionable_cli_error_line(&[&exec.stderr, &exec.stdout])
+            .unwrap_or_else(|| "Failed to stop OpenClaw gateway".to_string())
+    };
+    CommandResponse {
+        success,
+        stdout: exec.stdout,
+        stderr: exec.stderr,
+        exit_code: exec.exit_code,
+        message,
+        parsed_json: None,
+    }
+}
+
+#[tauri::command]
+fn restart_openclaw() -> CommandResponse {
+    run_openclaw_command(&["gateway", "stop", "--json"]);
+    do_launch_openclaw()
+}
+
+fn openclaw_backups_dir() -> Result<PathBuf, String> {
+    let dir = home_dir()
+        .ok_or_else(|| "HOME directory is not available".to_string())?
+        .join(".openclaw")
+        .join("backups");
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| format!("failed to create backups directory: {err}"))?;
+    Ok(dir)
+}
+
+fn prune_old_backups(dir: &PathBuf, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .ends_with(".tar.gz")
+        })
+        .filter_map(|e| {
+            let path = e.path();
+            let modified = e.metadata().and_then(|m| m.modified()).ok()?;
+            Some((modified, path))
+        })
+        .collect();
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in files.into_iter().skip(keep) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[tauri::command]
+fn backup_openclaw() -> CommandResponse {
+    let backups_dir = match openclaw_backups_dir() {
+        Ok(dir) => dir,
+        Err(err) => return CommandResponse::failure("Failed to create backup", err),
+    };
+    let exec = run_openclaw_command(&[
+        "backup",
+        "create",
+        "--output",
+        backups_dir.to_string_lossy().as_ref(),
+        "--json",
+    ]);
+    let success = exec.exit_code == 0;
+    if success {
+        prune_old_backups(&backups_dir, 10);
+    }
+    let message = if success {
+        "Backup created successfully".to_string()
+    } else {
+        pick_actionable_cli_error_line(&[&exec.stderr, &exec.stdout])
+            .unwrap_or_else(|| "Failed to create backup".to_string())
+    };
+    CommandResponse {
+        success,
+        stdout: exec.stdout,
+        stderr: exec.stderr,
+        exit_code: exec.exit_code,
+        message,
+        parsed_json: None,
+    }
+}
+
+#[tauri::command]
+fn list_backups() -> CommandResponse {
+    let backups_dir = match openclaw_backups_dir() {
+        Ok(dir) => dir,
+        Err(err) => return CommandResponse::failure("Failed to list backups", err),
+    };
+    let Ok(entries) = std::fs::read_dir(&backups_dir) else {
+        return CommandResponse {
+            success: true,
+            stdout: "[]".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            message: "No backups found".to_string(),
+            parsed_json: Some(Value::Array(vec![])),
+        };
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf, u64)> = entries
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".tar.gz"))
+        .filter_map(|e| {
+            let path = e.path();
+            let meta = e.metadata().ok()?;
+            let modified = meta.modified().ok()?;
+            Some((modified, path, meta.len()))
+        })
+        .collect();
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    let entries_json: Vec<Value> = files
+        .into_iter()
+        .map(|(modified, path, size)| {
+            let modified_secs = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let filename = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            serde_json::json!({
+                "path": path.to_string_lossy(),
+                "filename": filename,
+                "size_bytes": size,
+                "modified_secs": modified_secs,
+            })
+        })
+        .collect();
+    let parsed = Value::Array(entries_json.clone());
+    let stdout = serde_json::to_string_pretty(&parsed).unwrap_or_default();
+    CommandResponse {
+        success: true,
+        stdout,
+        stderr: String::new(),
+        exit_code: 0,
+        message: format!("{} backup(s) found", entries_json.len()),
+        parsed_json: Some(parsed),
+    }
+}
+
+#[tauri::command]
+fn restore_backup(archive_path: String) -> CommandResponse {
+    let archive = PathBuf::from(&archive_path);
+    if !archive.is_file() {
+        return CommandResponse::failure(
+            "Failed to restore backup",
+            format!("archive not found: {archive_path}"),
+        );
+    }
+    let config_path = match openclaw_config_path() {
+        Ok(p) => p,
+        Err(err) => return CommandResponse::failure("Failed to restore backup", err),
+    };
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let tmp_dir = std::env::temp_dir().join(format!("oc_restore_{timestamp}"));
+    if let Err(err) = std::fs::create_dir_all(&tmp_dir) {
+        return CommandResponse::failure(
+            "Failed to restore backup",
+            format!("could not create temp dir: {err}"),
+        );
+    }
+    let extract = run_shell(&format!(
+        "tar -xzf {} -C {}",
+        archive.to_string_lossy(),
+        tmp_dir.to_string_lossy(),
+    ));
+    if extract.exit_code != 0 {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return CommandResponse::failure(
+            "Failed to restore backup",
+            format!("tar extract failed: {}", extract.stderr),
+        );
+    }
+    let restored_config = find_file_recursive(&tmp_dir, "openclaw.json");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let Some(restored_config) = restored_config else {
+        return CommandResponse::failure(
+            "Failed to restore backup",
+            "openclaw.json not found in backup archive",
+        );
+    };
+    if let Err(err) = std::fs::copy(&restored_config, &config_path) {
+        return CommandResponse::failure(
+            "Failed to restore backup",
+            format!("could not copy config: {err}"),
+        );
+    }
+    CommandResponse {
+        success: true,
+        stdout: format!("Config restored from {}", archive.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()),
+        stderr: String::new(),
+        exit_code: 0,
+        message: "Config restored. Restart OpenClaw to apply changes.".to_string(),
+        parsed_json: None,
+    }
+}
+
+fn find_file_recursive(dir: &PathBuf, filename: &str) -> Option<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && path.file_name().map(|n| n == filename).unwrap_or(false) {
+            return Some(path);
+        }
+        if path.is_dir() {
+            if let Some(found) = find_file_recursive(&path, filename) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -2911,7 +3143,12 @@ fn main() {
             open_dashboard,
             read_openclaw_providers,
             write_openclaw_provider,
-            launch_openclaw
+            launch_openclaw,
+            stop_openclaw,
+            restart_openclaw,
+            backup_openclaw,
+            list_backups,
+            restore_backup
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

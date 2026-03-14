@@ -70,3 +70,23 @@ export function writeOpenclawProvider(payload: WriteOpenclawProviderPayload) {
 export function launchOpenclaw() {
   return call("launch_openclaw");
 }
+
+export function stopOpenclaw() {
+  return call("stop_openclaw");
+}
+
+export function restartOpenclaw() {
+  return call("restart_openclaw");
+}
+
+export function backupOpenclaw() {
+  return call("backup_openclaw");
+}
+
+export function listBackups() {
+  return call("list_backups");
+}
+
+export function restoreBackup(archivePath: string) {
+  return call("restore_backup", { archivePath });
+}

@@ -14,3 +14,10 @@ export interface WriteOpenclawProviderPayload {
   api: string;
   defaultModel: string;
 }
+
+export interface BackupEntry {
+  path: string;
+  filename: string;
+  size_bytes: number;
+  modified_secs: number;
+}

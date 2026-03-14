@@ -1,18 +1,25 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  backupOpenclaw,
   detectOpenclaw,
   gatewayStatus as getLaunchStatus,
   installOpenclaw,
   launchOpenclaw,
+  listBackups,
   openDashboard as openOpenclawHome,
   readOpenclawProviders as readAiConnections,
+  restartOpenclaw,
+  restoreBackup,
+  stopOpenclaw,
   writeOpenclawProvider as saveAiConnection,
 } from "./lib/tauri";
-import type { CommandResponse } from "./types";
+import type { BackupEntry, CommandResponse } from "./types";
 
 type Locale = "zh-CN" | "en-US";
+type AppMode = "booting" | "wizard" | "dashboard";
 type StepId = "welcome" | "install" | "model" | "launch" | "success";
 type BusyAction = "check" | "install" | "connect" | "launch" | "enter" | null;
+type DashBusyAction = "start" | "stop" | "restart" | "open" | "backup" | "restore" | "save-provider" | "refresh" | null;
 type NoticeKind = "info" | "success" | "error";
 type ServicePresetId = "openai" | "kimi" | "glm" | "openrouter" | "custom";
 type OpenclawCompatibilityValue =
@@ -1329,6 +1336,7 @@ function buttonClassName(...tokens: Array<string | false | null | undefined>) {
 
 export default function App() {
   const [locale, setLocale] = useState<Locale>(getInitialLocale());
+  const [appMode, setAppMode] = useState<AppMode>("booting");
   const [currentStep, setCurrentStep] = useState<StepId>("welcome");
   const [busyAction, setBusyAction] = useState<BusyAction>(null);
   const [bootstrapping, setBootstrapping] = useState(false);
@@ -1341,6 +1349,14 @@ export default function App() {
   const [selectedCompatibilityMode, setSelectedCompatibilityMode] = useState<CompatibilityModeId>("openai-completions");
   const [customCompatibilityValue, setCustomCompatibilityValue] = useState("");
   const [serviceForm, setServiceForm] = useState<ServiceFormState>(DEFAULT_FORM);
+  // Dashboard state
+  const [dashBusy, setDashBusy] = useState<DashBusyAction>(null);
+  const [dashNotice, setDashNotice] = useState<Notice | null>(null);
+  const [providers, setProviders] = useState<Record<string, unknown>>({});
+  const [backups, setBackups] = useState<BackupEntry[]>([]);
+  const [expandedProviderKey, setExpandedProviderKey] = useState<string | null>(null);
+  const [dashProviderForm, setDashProviderForm] = useState<ServiceFormState>(DEFAULT_FORM);
+  const [dashProviderApiKey, setDashProviderApiKey] = useState("");
 
   const copy = useMemo(() => I18N[locale], [locale]);
   const launchReady = isLaunchReady(launchState);
@@ -1355,6 +1371,17 @@ export default function App() {
   const connectedServiceLabel = aiConnection.connected
     ? serviceLabelForProvider(locale, aiConnection.providerName, aiConnection.baseUrl)
     : copy.states.waiting;
+
+  const overlayText = busyAction === "install" ? copy.actions.installing
+    : busyAction === "connect" ? copy.actions.connecting
+    : busyAction === "launch" ? copy.actions.launching
+    : busyAction === "enter" ? copy.actions.starting
+    : "";
+
+  useEffect(() => {
+    void initApp();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -1570,20 +1597,464 @@ export default function App() {
 
   async function handleStartUsing() {
     setBusyAction("enter");
-    const response = await openOpenclawHome();
-
-    if (response.success) {
-      setNotice({ kind: "success", text: copy.notices.openSuccess });
-    } else {
-      setNotice({ kind: "error", text: mergeNoticeText(copy.notices.openFailed, commandErrorDetail(response)) });
-    }
-
+    const snapshots = await readSnapshots();
+    applySnapshots(snapshots);
     setBusyAction(null);
+    setAppMode("dashboard");
+    await loadDashboardData();
+    void silentAutoBackup();
   }
 
-  const canSkipSavingAi = aiConnection.connected && !serviceForm.apiKey.trim();
+  async function initApp() {
+    const snapshots = await readSnapshots();
+    applySnapshots(snapshots);
+    if (snapshots.install.installed && snapshots.connection.connected && isLaunchReady(snapshots.launch)) {
+      setAppMode("dashboard");
+      await loadDashboardData();
+      void silentAutoBackup();
+    } else {
+      setCurrentStep(nextBlockingStep(snapshots.install, snapshots.connection, snapshots.launch));
+      setAppMode("wizard");
+    }
+  }
+
+  async function loadDashboardData() {
+    const [providersResp, backupsResp] = await Promise.all([readAiConnections(), listBackups()]);
+    if (providersResp.success && isRecord(providersResp.parsed_json)) {
+      setProviders(providersResp.parsed_json as Record<string, unknown>);
+    }
+    if (backupsResp.success && Array.isArray(backupsResp.parsed_json)) {
+      setBackups(backupsResp.parsed_json as BackupEntry[]);
+    }
+  }
+
+  async function silentAutoBackup() {
+    const resp = await backupOpenclaw();
+    if (resp.success) {
+      const backupsResp = await listBackups();
+      if (backupsResp.success && Array.isArray(backupsResp.parsed_json)) {
+        setBackups(backupsResp.parsed_json as BackupEntry[]);
+      }
+    }
+  }
+
+  async function handleDashStart() {
+    setDashBusy("start");
+    setDashNotice({ kind: "info", text: locale === "zh-CN" ? "正在启动..." : "Starting..." });
+    const response = await launchOpenclaw();
+    const snapshots = await readSnapshots();
+    applySnapshots(snapshots);
+    setDashBusy(null);
+    if (response.success || isLaunchReady(snapshots.launch)) {
+      setDashNotice({ kind: "success", text: locale === "zh-CN" ? "OpenClaw 已启动" : "OpenClaw started" });
+    } else {
+      setDashNotice({ kind: "error", text: response.message || (locale === "zh-CN" ? "启动失败" : "Failed to start") });
+    }
+  }
+
+  async function handleDashStop() {
+    setDashBusy("stop");
+    setDashNotice({ kind: "info", text: locale === "zh-CN" ? "正在停止..." : "Stopping..." });
+    const response = await stopOpenclaw();
+    const snapshots = await readSnapshots();
+    applySnapshots(snapshots);
+    setDashBusy(null);
+    if (response.success) {
+      setDashNotice({ kind: "success", text: locale === "zh-CN" ? "OpenClaw 已停止" : "OpenClaw stopped" });
+    } else {
+      setDashNotice({ kind: "error", text: response.message || (locale === "zh-CN" ? "停止失败" : "Failed to stop") });
+    }
+  }
+
+  async function handleDashRestart() {
+    setDashBusy("restart");
+    setDashNotice({ kind: "info", text: locale === "zh-CN" ? "正在重启..." : "Restarting..." });
+    const response = await restartOpenclaw();
+    const snapshots = await readSnapshots();
+    applySnapshots(snapshots);
+    setDashBusy(null);
+    if (response.success || isLaunchReady(snapshots.launch)) {
+      setDashNotice({ kind: "success", text: locale === "zh-CN" ? "OpenClaw 已重启" : "OpenClaw restarted" });
+    } else {
+      setDashNotice({ kind: "error", text: response.message || (locale === "zh-CN" ? "重启失败" : "Failed to restart") });
+    }
+  }
+
+  async function handleDashOpenBrowser() {
+    setDashBusy("open");
+    const response = await openOpenclawHome();
+    setDashBusy(null);
+    if (!response.success) {
+      setDashNotice({ kind: "error", text: response.message || (locale === "zh-CN" ? "无法打开 Dashboard" : "Failed to open Dashboard") });
+    }
+  }
+
+  async function handleDashRefresh() {
+    setDashBusy("refresh");
+    const snapshots = await readSnapshots();
+    applySnapshots(snapshots);
+    await loadDashboardData();
+    setDashBusy(null);
+    setDashNotice({ kind: "success", text: locale === "zh-CN" ? "状态已刷新" : "Status refreshed" });
+  }
+
+  async function handleDashBackup() {
+    setDashBusy("backup");
+    setDashNotice({ kind: "info", text: locale === "zh-CN" ? "正在创建备份..." : "Creating backup..." });
+    const response = await backupOpenclaw();
+    if (response.success) {
+      const backupsResp = await listBackups();
+      if (backupsResp.success && Array.isArray(backupsResp.parsed_json)) {
+        setBackups(backupsResp.parsed_json as BackupEntry[]);
+      }
+      setDashNotice({ kind: "success", text: locale === "zh-CN" ? "备份已创建" : "Backup created" });
+    } else {
+      setDashNotice({ kind: "error", text: response.message || (locale === "zh-CN" ? "备份失败" : "Failed to create backup") });
+    }
+    setDashBusy(null);
+  }
+
+  async function handleDashRestore(archivePath: string) {
+    setDashBusy("restore");
+    setDashNotice({ kind: "info", text: locale === "zh-CN" ? "正在恢复备份..." : "Restoring backup..." });
+    const response = await restoreBackup(archivePath);
+    setDashBusy(null);
+    if (response.success) {
+      setDashNotice({ kind: "success", text: response.message });
+    } else {
+      setDashNotice({ kind: "error", text: response.message || (locale === "zh-CN" ? "恢复失败" : "Failed to restore backup") });
+    }
+  }
+
+  function handleDashProviderEdit(providerKey: string, providerData: unknown) {
+    if (!isRecord(providerData)) return;
+    const api = toText(providerData.api).trim();
+    const baseUrl = toText(providerData.baseUrl).trim();
+    const model = defaultModelFromProviderModels(providerData.models);
+    const presetId = presetIdFromProvider(providerKey, baseUrl);
+    const compatMode = compatibilityModeIdFromValue(api);
+    setExpandedProviderKey(providerKey);
+    setDashProviderApiKey("");
+    setSelectedPreset(presetId);
+    setSelectedCompatibilityMode(compatMode);
+    setCustomCompatibilityValue(compatMode === "custom" ? api : "");
+    setShowAdvancedFields(presetId === "custom");
+    setDashProviderForm({
+      providerName: providerKey,
+      baseUrl,
+      api,
+      defaultModel: model,
+      apiKey: "",
+    });
+  }
+
+  async function handleDashSaveProvider() {
+    const compatibilityValue = selectedCompatibilityMode === "custom"
+      ? customCompatibilityValue.trim()
+      : COMPATIBILITY_MODE_OPTIONS[selectedCompatibilityMode].value;
+
+    if (!dashProviderApiKey.trim() && !dashProviderForm.baseUrl.trim()) {
+      setDashNotice({ kind: "error", text: copy.notices.keyRequired });
+      return;
+    }
+
+    setDashBusy("save-provider");
+    setDashNotice({ kind: "info", text: locale === "zh-CN" ? "保存前备份配置..." : "Backing up config before saving..." });
+    const backupResp = await backupOpenclaw();
+    if (!backupResp.success) {
+      setDashBusy(null);
+      setDashNotice({ kind: "error", text: locale === "zh-CN" ? "备份失败，未保存配置。" : "Backup failed. Config not saved." });
+      return;
+    }
+
+    setDashNotice({ kind: "info", text: locale === "zh-CN" ? "正在保存..." : "Saving..." });
+    const response = await saveAiConnection({
+      providerName: dashProviderForm.providerName,
+      baseUrl: dashProviderForm.baseUrl,
+      apiKey: dashProviderApiKey,
+      api: compatibilityValue,
+      defaultModel: dashProviderForm.defaultModel,
+    });
+
+    if (response.success) {
+      setExpandedProviderKey(null);
+      setDashProviderApiKey("");
+      setShowAdvancedFields(false);
+      const [providersResp, backupsResp] = await Promise.all([readAiConnections(), listBackups()]);
+      if (providersResp.success && isRecord(providersResp.parsed_json)) {
+        setProviders(providersResp.parsed_json as Record<string, unknown>);
+      }
+      if (backupsResp.success && Array.isArray(backupsResp.parsed_json)) {
+        setBackups(backupsResp.parsed_json as BackupEntry[]);
+      }
+      setDashNotice({ kind: "success", text: copy.notices.connectSuccess });
+    } else {
+      setDashNotice({ kind: "error", text: mergeNoticeText(copy.notices.connectFailed, commandErrorDetail(response)) });
+    }
+    setDashBusy(null);
+  }
+
+  function renderDashboard() {
+    const isReady = isLaunchReady(launchState);
+    const controlBusy = dashBusy !== null;
+    const zh = locale === "zh-CN";
+
+    return (
+      <div className="dashboard-shell">
+        <main className="dashboard-stage">
+          <header className="topbar">
+            <div className="brand-lockup">
+              <span className="brand-name">{copy.brand}</span>
+              <span className="brand-subtitle">{isReady ? (zh ? "运行中" : "Running") : (zh ? "已停止" : "Stopped")}</span>
+            </div>
+            <button
+              type="button"
+              className={buttonClassName("button button-ghost", dashBusy === "refresh" && "button-loading")}
+              onClick={() => void handleDashRefresh()}
+              disabled={controlBusy}
+            >
+              {dashBusy === "refresh" ? copy.actions.checking : copy.actions.checkAgain}
+            </button>
+          </header>
+
+          {dashNotice ? <div className={`notice notice-${dashNotice.kind}`}>{dashNotice.text}</div> : null}
+
+          <div className="dashboard-grid">
+            <div className="dashboard-left">
+              <div className="dash-card">
+                <p className="dash-card-title">{zh ? "状态" : "STATUS"}</p>
+                <div className="dash-status-dots">
+                  <span className="dash-status-dot">
+                    <span className={`dot ${launchState.serviceReady === true ? "dot-ready" : launchState.serviceReady === false ? "dot-error" : ""}`} />
+                    {copy.launch.cards.service}
+                  </span>
+                  <span className="dash-status-dot">
+                    <span className={`dot ${launchState.localReady === true ? "dot-ready" : launchState.localReady === false ? "dot-error" : ""}`} />
+                    {copy.launch.cards.local}
+                  </span>
+                  <span className="dash-status-dot">
+                    <span className={`dot ${launchState.appReady === true ? "dot-ready" : launchState.appReady === false ? "dot-error" : ""}`} />
+                    {copy.launch.cards.app}
+                  </span>
+                </div>
+              </div>
+
+              <div className="dash-card">
+                <p className="dash-card-title">{zh ? "控制" : "CONTROLS"}</p>
+                <div className="control-buttons">
+                  <button
+                    type="button"
+                    className={buttonClassName("button button-control button-control-primary", dashBusy === "start" && "button-loading")}
+                    onClick={() => void handleDashStart()}
+                    disabled={controlBusy}
+                  >
+                    {zh ? "启动" : "Start"}
+                  </button>
+                  <button
+                    type="button"
+                    className={buttonClassName("button button-control", dashBusy === "restart" && "button-loading")}
+                    onClick={() => void handleDashRestart()}
+                    disabled={controlBusy}
+                  >
+                    {zh ? "重启" : "Restart"}
+                  </button>
+                  <button
+                    type="button"
+                    className={buttonClassName("button button-control button-control-danger", dashBusy === "stop" && "button-loading")}
+                    onClick={() => void handleDashStop()}
+                    disabled={controlBusy || !isReady}
+                  >
+                    {zh ? "停止" : "Stop"}
+                  </button>
+                  <button
+                    type="button"
+                    className={buttonClassName("button button-control", dashBusy === "open" && "button-loading")}
+                    onClick={() => void handleDashOpenBrowser()}
+                    disabled={dashBusy === "open"}
+                  >
+                    {zh ? "打开 Dashboard ↗" : "Open Dashboard ↗"}
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="dashboard-right">
+              <div className="dash-card">
+                <p className="dash-card-title">{zh ? "AI 供应商" : "AI PROVIDER"}</p>
+                <div className="provider-list">
+                  {Object.entries(providers).map(([key, value]) => {
+                    if (!isRecord(value)) return null;
+                    const model = defaultModelFromProviderModels(value.models);
+                    const baseUrl = toText(value.baseUrl).trim();
+                    const isExpanded = expandedProviderKey === key;
+                    return (
+                      <div key={key}>
+                        <button
+                          type="button"
+                          className={`provider-card ${isExpanded ? "provider-card-active" : ""}`}
+                          onClick={() => {
+                            if (isExpanded) {
+                              setExpandedProviderKey(null);
+                              setShowAdvancedFields(false);
+                            } else {
+                              handleDashProviderEdit(key, value);
+                            }
+                          }}
+                          disabled={controlBusy}
+                        >
+                          <div className="provider-card-header">
+                            <span className="provider-card-name">{key}</span>
+                            {model ? <span className="badge-tag">{model}</span> : null}
+                          </div>
+                          <div className="provider-card-meta">{baseUrl || "—"}</div>
+                        </button>
+
+                        {isExpanded ? (
+                          <div className="provider-edit-form">
+                            <label className="field">
+                              <span>{copy.model.accessKeyLabel}</span>
+                              <input
+                                type="password"
+                                value={dashProviderApiKey}
+                                placeholder="sk-..."
+                                onChange={(e) => setDashProviderApiKey(e.target.value)}
+                              />
+                            </label>
+                            <label className="field">
+                              <span>{copy.model.modelLabel}</span>
+                              <input
+                                type="text"
+                                value={dashProviderForm.defaultModel}
+                                onChange={(e) => setDashProviderForm((c) => ({ ...c, defaultModel: e.target.value }))}
+                              />
+                            </label>
+                            <div className="inline-bar">
+                              <button
+                                type="button"
+                                className="button button-ghost"
+                                onClick={() => setShowAdvancedFields((c) => !c)}
+                              >
+                                {showAdvancedFields ? copy.actions.hideAdvanced : copy.actions.showAdvanced}
+                              </button>
+                            </div>
+                            {showAdvancedFields ? (
+                              <div className="form-stack form-stack-tight">
+                                <label className="field">
+                                  <span>{copy.model.baseUrlLabel}</span>
+                                  <input
+                                    type="text"
+                                    value={dashProviderForm.baseUrl}
+                                    onChange={(e) => setDashProviderForm((c) => ({ ...c, baseUrl: e.target.value }))}
+                                  />
+                                </label>
+                                <label className="field">
+                                  <span>{copy.model.apiLabel}</span>
+                                  <select
+                                    value={selectedCompatibilityMode}
+                                    onChange={(e) => handleCompatibilityModeChange(e.target.value as CompatibilityModeId)}
+                                  >
+                                    {(Object.entries(COMPATIBILITY_MODE_OPTIONS) as Array<[CompatibilityModeId, CompatibilityModeOption]>).map(([modeId, option]) => (
+                                      <option key={modeId} value={modeId}>{option.label[locale]}</option>
+                                    ))}
+                                  </select>
+                                </label>
+                                {selectedCompatibilityMode === "custom" ? (
+                                  <label className="field">
+                                    <span>{copy.model.customApiLabel}</span>
+                                    <input
+                                      type="text"
+                                      value={customCompatibilityValue}
+                                      onChange={(e) => {
+                                        setCustomCompatibilityValue(e.target.value);
+                                        setDashProviderForm((c) => ({ ...c, api: e.target.value }));
+                                      }}
+                                    />
+                                  </label>
+                                ) : null}
+                              </div>
+                            ) : null}
+                            <div className="provider-edit-actions">
+                              <button
+                                type="button"
+                                className="button button-secondary"
+                                onClick={() => { setExpandedProviderKey(null); setShowAdvancedFields(false); }}
+                                disabled={dashBusy === "save-provider"}
+                              >
+                                {zh ? "取消" : "Cancel"}
+                              </button>
+                              <button
+                                type="button"
+                                className={buttonClassName("button button-primary", dashBusy === "save-provider" && "button-loading")}
+                                onClick={() => void handleDashSaveProvider()}
+                                disabled={dashBusy === "save-provider"}
+                              >
+                                {dashBusy === "save-provider" ? copy.actions.connecting : (zh ? "保存" : "Save")}
+                              </button>
+                            </div>
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="dash-card">
+                <div className="inline-bar" style={{ alignItems: "center" }}>
+                  <p className="dash-card-title" style={{ margin: 0 }}>{zh ? "配置备份" : "CONFIG BACKUP"}</p>
+                  <button
+                    type="button"
+                    className={buttonClassName("button button-ghost", dashBusy === "backup" && "button-loading")}
+                    onClick={() => void handleDashBackup()}
+                    disabled={controlBusy}
+                    style={{ fontSize: "0.8rem" }}
+                  >
+                    {dashBusy === "backup" ? (zh ? "备份中..." : "Backing up...") : (zh ? "+ 立即备份" : "+ Backup now")}
+                  </button>
+                </div>
+                {backups.length === 0 ? (
+                  <p className="helper-copy" style={{ margin: 0 }}>{zh ? "暂无备份（将在启动时自动创建）" : "No backups yet (auto-created on launch)"}</p>
+                ) : (
+                  <div className="backup-list">
+                    {backups.slice(0, 5).map((backup) => {
+                      const date = new Date(backup.modified_secs * 1000);
+                      const dateStr = date.toLocaleString(zh ? "zh-CN" : "en-US", {
+                        month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+                      });
+                      const sizeMb = (backup.size_bytes / 1024 / 1024).toFixed(1);
+                      return (
+                        <div key={backup.path} className="backup-row">
+                          <div className="backup-row-meta">
+                            <span className="backup-row-date">{dateStr}</span>
+                            <span className="backup-row-size">{sizeMb} MB</span>
+                          </div>
+                          <button
+                            type="button"
+                            className={buttonClassName("button button-ghost", dashBusy === "restore" && "button-loading")}
+                            style={{ fontSize: "0.8rem", minWidth: "auto", padding: "0 10px" }}
+                            onClick={() => void handleDashRestore(backup.path)}
+                            disabled={controlBusy}
+                          >
+                            {zh ? "恢复" : "Restore"}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </main>
+      </div>
+    );
+  }
+
+
 
   function renderStage() {
+    const canSkipSavingAi = aiConnection.connected && !serviceForm.apiKey.trim();
+
     if (currentStep === "welcome") {
       return (
         <>
@@ -1910,6 +2381,22 @@ export default function App() {
     );
   }
 
+  if (appMode === "booting") {
+    return (
+      <div className="installer-shell">
+        <main className="installer-stage">
+          <section className="stage-card" style={{ minHeight: 200, display: "flex", alignItems: "center", justifyContent: "center" }}>
+            <div className="step-overlay-spinner" />
+          </section>
+        </main>
+      </div>
+    );
+  }
+
+  if (appMode === "dashboard") {
+    return renderDashboard();
+  }
+
   return (
     <div className="installer-shell">
       <main className="installer-stage">
@@ -1929,7 +2416,15 @@ export default function App() {
 
         {notice ? <div className={`notice notice-${notice.kind}`}>{notice.text}</div> : null}
 
-        <section className="stage-card">{renderStage()}</section>
+        <section className="stage-card step-wrap">
+          {renderStage()}
+          {busyAction && busyAction !== "check" ? (
+            <div className="step-overlay">
+              <div className="step-overlay-spinner" />
+              <p className="step-overlay-text">{overlayText}</p>
+            </div>
+          ) : null}
+        </section>
 
         <p className="support-copy">{copy.previewHint}</p>
       </main>
